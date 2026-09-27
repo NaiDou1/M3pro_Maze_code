@@ -53,6 +53,28 @@ class MissionState(Enum):
     FAULT = auto()     # 碰撞/丢线/连续失败，等待人工介入
 
 
+def should_approach(distance: float, trigger_distance: float) -> bool:
+    """判断是否应转入对位。
+
+    相机在巡线姿态下能看到 1~2m 外的方块；若远处就转去对位，会脱离格心、
+    打乱 DFS 拓扑，因此**只在进入触发距离后**才转入。
+
+    :param distance: 方块相对车体的水平距离（米）。
+    :param trigger_distance: 触发阈值（米）。
+    """
+    return distance <= trigger_distance
+
+
+def approach_step(distance: float, target_distance: float, limit: float = 0.20) -> float:
+    """由当前水平距离算对位时应前进的量（米）：正为前进、负为后退。
+
+    按剩余距离自适应，并限幅避免单步冲过头。返回 0 表示已在目标附近，
+    调用方应据此外结束循环。
+    """
+    step = distance - target_distance
+    return max(-limit, min(limit, step))
+
+
 class MissionManager(Node):
     """任务编排节点。"""
 
@@ -286,7 +308,7 @@ class MissionManager(Node):
         block = self._nearest_block()
         if block is not None:
             d = block.horizontal_distance()
-            if d <= self._trigger_distance:
+            if should_approach(d, self._trigger_distance):
                 self._pending_block = block
                 self.get_logger().info(
                     f'发现 {block.color} 方块，距离 {d:.3f}m，转入对位'
@@ -335,8 +357,7 @@ class MissionManager(Node):
             if self.grasp.in_envelope(block):
                 break
             # 自适应步长：按剩余距离走，单步限幅避免一次冲过头
-            step = d - self._approach_target
-            step = max(-0.20, min(0.20, step))
+            step = approach_step(d, self._approach_target)
             if abs(step) < 0.02:
                 break
             self.motion.advance(step)
