@@ -54,3 +54,16 @@
     odom_linear_scale_correction: 1.0
     #: 单格推进的超时保护 (s)，超时进入 FAULT
     advance_timeout: 12.0
+
+    # ---------------- 目标触发与对位 ----------------
+    #: 仅在方块水平距离小于该值时才转入对位。相机在巡线姿态下可看到 1~2m 外，
+    #: 若远处就冲过去会脱离格心、打乱 DFS 拓扑。
+    detect_trigger_distance: 0.60
+    #: 对位循环步数上限（步长自适应，单步限幅 0.20m）
+    approach_max_steps: 20
+    #: 对位目标水平距离，须落在机械臂抓取包络 0.13~0.25m 内
+    approach_target_distance: 0.20
+    #: 每色方块数量上限（赛题规定每色 2 个），达到后不再触发该色
+    per_color_quota: 2
+    #: 抓取成功后的检测抑制时长 (s)，防止筐内或残余方块被重复触发
+    block_suppress_sec: 3.0

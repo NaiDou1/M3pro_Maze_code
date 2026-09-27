@@ -114,6 +114,11 @@ class MissionManager(Node):
 
         self.state = MissionState.INIT
         self._failed_advances = 0
+        #: 各颜色已收集数量。达到配额后不再触发该色，防止同一物理方块被
+        #: 反复识别（方块被拿走后若筐内方块落入视野，会造成重复抓取）
+        self._collected_by_color = {name: 0 for name in COLOR_NAMES}
+        #: 抓取成功后的检测抑制截止时刻（monotonic）
+        self._suppress_until = 0.0
         self.get_logger().info(
             f'MissionManager 就绪 | 场地 {self._grid_size}x{self._grid_size} '
             f'格距 {self._cell_size}m | 入口 {self._origin_rc} 出口 {self._exit_rc}'
@@ -154,6 +159,12 @@ class MissionManager(Node):
         self.declare_parameter('mount_xyz', [0.10, 0.0, 0.35])
         self.declare_parameter('mount_rpy', [0.0, 0.0, 0.0])
         self.declare_parameter('mount_calibrated', False)
+        # 目标触发与对位
+        self.declare_parameter('detect_trigger_distance', 0.60)
+        self.declare_parameter('approach_max_steps', 20)
+        self.declare_parameter('approach_target_distance', 0.20)
+        self.declare_parameter('per_color_quota', 2)
+        self.declare_parameter('block_suppress_sec', 3.0)
 
         p = self.get_parameter
         self._grid_size = int(p('grid_size').value)
@@ -182,6 +193,11 @@ class MissionManager(Node):
         self._mount_xyz = [float(v) for v in p('mount_xyz').value]
         self._mount_rpy = [float(v) for v in p('mount_rpy').value]
         self._mount_calibrated = bool(p('mount_calibrated').value)
+        self._trigger_distance = float(p('detect_trigger_distance').value)
+        self._approach_max_steps = int(p('approach_max_steps').value)
+        self._approach_target = float(p('approach_target_distance').value)
+        self._per_color_quota = int(p('per_color_quota').value)
+        self._suppress_sec = float(p('block_suppress_sec').value)
 
     def _spin(self, timeout: float) -> None:
         """统一 spin 入口：驱动本节点与三个子节点。"""
@@ -258,14 +274,24 @@ class MissionManager(Node):
         front, left, right = self.motion.scan_openings()
         self.mapper.observe(cur, heading, front, left, right)
 
-        # 2) 视野内是否有方块（遇块即抓）
+        # 2) 视野内是否有足够近的方块（遇块即抓）
+        #    相机巡线姿态下能看到 1~2m 外的方块。若远处就转去对位，会脱离格心、
+        #    打乱 DFS 拓扑，因此只在进入触发距离后才转入 APPROACH；更远的方块
+        #    等走格自然靠近后再处理。
         block = self._nearest_block()
         if block is not None:
-            self._pending_block = block
+            d = block.horizontal_distance()
+            if d <= self._trigger_distance:
+                self._pending_block = block
+                self.get_logger().info(
+                    f'发现 {block.color} 方块，距离 {d:.3f}m，转入对位'
+                )
+                return MissionState.APPROACH
             self.get_logger().info(
-                f'发现 {block.color} 方块，距离 {block.horizontal_distance():.3f}m'
+                f'检出 {block.color} 方块但距离 {d:.3f}m 超过触发阈值 '
+                f'{self._trigger_distance:.2f}m，继续探索靠近',
+                throttle_duration_sec=5.0,
             )
-            return MissionState.APPROACH
 
         # 3) DFS 决策
         decision = self.planner.decide()
@@ -299,13 +325,13 @@ class MissionManager(Node):
         if block is None:
             return MissionState.EXPLORE
 
-        for _ in range(4):
+        for _ in range(self._approach_max_steps):
             d = block.horizontal_distance()
             if self.grasp.in_envelope(block):
                 break
-            step = d - 0.20  # 目标水平距离
-            # 限幅，避免一次冲过头
-            step = max(-0.15, min(0.15, step))
+            # 自适应步长：按剩余距离走，单步限幅避免一次冲过头
+            step = d - self._approach_target
+            step = max(-0.20, min(0.20, step))
             if abs(step) < 0.02:
                 break
             self.motion.advance(step)
@@ -339,6 +365,16 @@ class MissionManager(Node):
         ok = self.grasp.execute(block)
         if ok:
             self.planner.mark_done(target)
+            self._collected_by_color[block.color] = (
+                self._collected_by_color.get(block.color, 0) + 1
+            )
+            # 抑制期内不再触发检测：方块刚被拿走，视野里可能仍残留、
+            # 或收集筐里的方块进入视野，都会造成重复抓取
+            self._suppress_until = time.monotonic() + self._suppress_sec
+            self.get_logger().info(
+                f'已收集 {block.color}，该色累计 '
+                f'{self._collected_by_color[block.color]} 个'
+            )
         else:
             self.planner.mark_failed(target)
 
@@ -384,10 +420,23 @@ class MissionManager(Node):
         return MissionState.EXPLORE
 
     def _nearest_block(self, color: Optional[str] = None) -> Optional[BlockDetection]:
+        """返回视野内最近的可收集方块。
+
+        过滤两类目标，避免重复抓取：
+
+        * 抓取抑制期内一律返回 ``None``（刚抓完时视野可能仍有残留/筐内方块）；
+        * 已达颜色配额的目标（赛题规定每色 2 个）不再触发。
+        """
+        if time.monotonic() < self._suppress_until:
+            return None
         rgbd = self.sensors.get_rgbd()
         if rgbd is None:
             return None
-        detections = self.block_det.detect(rgbd[0], rgbd[1])
+        detections = [
+            d
+            for d in self.block_det.detect(rgbd[0], rgbd[1])
+            if self._collected_by_color.get(d.color, 0) < self._per_color_quota
+        ]
         return self.block_det.nearest(detections, color)
 
     def _param_list(self, name: str, default: List[int]) -> List[int]:
