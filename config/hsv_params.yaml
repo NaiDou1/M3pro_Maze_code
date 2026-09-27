@@ -1,0 +1,23 @@
+# HSV 阈值（格式 [Hmin, Smin, Vmin, Hmax, Smax, Vmax]，OpenCV 的 H 范围为 0~179）
+#
+# ⚠️ 以下四色初值沿用 M3Pro_demo/*.text，精度可接受；
+#    但黑线（line_hsv）为**估计值**，现有 LineFollowHSV.text
+#    ([34, 98, 74, 125, 253, 255]) 的 V_min=74 偏高、不符合黑色电工胶布的低明度
+#    特征，故不采用。**必须用 `ros2 run maze_explorer calibration_tool` 现场框选重标。**
+/**:
+  ros__parameters:
+    #: 黑色电工胶布引导线：低明度为主。现场务必重标。
+    line_hsv: [0, 0, 0, 180, 255, 80]
+
+    #: 四色方块（自备方块材质/光照不同，建议现场复核）
+    red_hsv:    [0, 154, 107, 184, 253, 255]
+    green_hsv:  [34, 130, 205, 125, 253, 255]
+    blue_hsv:   [55, 196, 137, 125, 253, 255]
+    yellow_hsv: [23, 99, 235, 125, 253, 255]
+
+    #: 黑线二值化后用于拟合的最小非零像素数，低于则判丢线
+    min_line_pixels: 200
+    #: 方块识别的最小轮廓面积（像素），滤除噪点
+    min_contour_area: 300
+    #: 形态学开运算核尺寸（像素），抑制噪声
+    morph_kernel: 5

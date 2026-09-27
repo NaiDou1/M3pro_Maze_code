@@ -1,0 +1,52 @@
+# 场地几何、运动限幅与激光判定参数
+#
+# 所有数值集中于此，代码中禁止硬编码。现场可根据实测微调后重启节点生效。
+/**:
+  ros__parameters:
+    # ---------------- 场地几何 ----------------
+    grid_size: 7              # 7 x 7 格
+    cell_size: 0.40           # 格心间距 (m)，与通道宽一致
+    channel_width: 0.40       # 通道宽度 (m)
+    robot_width: 0.215        # 车宽 (m)，附加装置不得超此宽度
+    robot_length: 0.275       # 车长 (m)
+    wall_height: 0.55         # 挡板高度 (m)，含机械臂总高不得超过
+    #: 通道内单侧余量 (40-21.5)/2 = 9.25cm，循迹精度须优于该值的一半
+    lateral_margin: 0.0925
+
+    # ---------------- 运动限幅 ----------------
+    max_linear_x: 0.25        # 前进/后退上限 (m/s)
+    max_linear_y: 0.20        # 横移上限 (m/s)，麦轮打滑使横移误差偏大
+    max_angular_z: 0.60       # 自转上限 (rad/s)
+    cruise_linear: 0.15       # 巡线巡航线速度 (m/s)
+    turn_angular: 0.50        # 原地 90 度旋转角速度 (rad/s)
+
+    # ---------------- 循迹 ----------------
+    #: 复用 follow_line.py 的经验值 [Kp, Ki, Kd]，单位对应像素偏差
+    line_pid: [50.0, 0.0, 10.0]
+    #: 只对图像下半部分做黑线二值化，降低计算量
+    line_roi_top_ratio: 0.5
+    #: 判定"线丢失"所需的连续空帧数，超过则触发丢线保护
+    line_lost_frames: 5
+
+    # ---------------- 激光判定 ----------------
+    front_angle_deg: 0.0      # 正前方扇区中心
+    left_angle_deg: 90.0      # 左侧扇区中心
+    right_angle_deg: -90.0    # 右侧扇区中心
+    rear_angle_deg: 180.0     # 正后方扇区中心
+    #: 判定开口时使用的扇区半宽（度）
+    opening_half_width_deg: 20.0
+    #: 扇区内最近距离大于该值即认定为"开口"（米）
+    opening_min_range: 0.55
+    #: 碰撞保护阈值：任意方向低于该距离立即停车（米）
+    safety_range: 0.25
+
+    # ---------------- 格心对齐与里程计 ----------------
+    #: 到达格心的位置容差 (m)
+    cell_advance_tolerance: 0.03
+    #: 朝向容差 (rad)，约 5 度
+    yaw_tolerance: 0.0873
+    #: 出厂标定系数（见 calibration 包）
+    odom_angular_scale_correction: 0.75
+    odom_linear_scale_correction: 1.0
+    #: 单格推进的超时保护 (s)，超时进入 FAULT
+    advance_timeout: 12.0
