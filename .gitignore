@@ -1,0 +1,18 @@
+# ROS 2 构建产物（正常情况下生成于工作区根目录，此处兜底）
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 编辑器与系统临时文件
+*~
+*.swp
+.vscode/
+.DS_Store
+
+# 运行日志
+*.log

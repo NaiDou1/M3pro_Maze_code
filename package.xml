@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>maze_explorer</name>
+  <version>0.1.0</version>
+  <description>
+    ROSMASTER M3 Pro 二维迷宫自主探索与彩色方块收集系统。
+    黑线循迹 + 7x7 网格拓扑建图 + DFS 先深后浅探索 + 六自由度机械臂抓取。
+    本包为新增包，不修改任何现有包源码。
+  </description>
+  <maintainer email="jetson-nx@example.com">jetson</maintainer>
+  <license>MIT</license>
+
+  <!-- ROS 2 核心 -->
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <!-- 视觉：RGB-D 同步与编解码 -->
+  <depend>cv_bridge</depend>
+
+  <!-- 机械臂：消息与 IK/FK 服务（yahboomcar_ws 内已有） -->
+  <depend>arm_msgs</depend>
+  <depend>arm_interface</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
