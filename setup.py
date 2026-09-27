@@ -24,9 +24,13 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # 顶层任务编排
+            # ---------- 用户入口（一般只用这两个）----------
+            'maze_run = maze_explorer.run_entry:main',
+            'maze_calib = maze_explorer.calib_entry:main',
+            # ---------- 调试入口（按需单独运行）----------
+            # 顶层任务编排（maze_run 的底层实现）
             'mission_manager = maze_explorer.mission_manager:main',
-            # 标定工具
+            # 标定流程（maze_calib 的底层实现，可 -p mode:=hsv|line_pose|motion）
             'calibration_tool = maze_explorer.calibration_tool:main',
             # 感知层（可独立运行用于调试出图）
             'line_detector = maze_explorer.line_detector:main',
