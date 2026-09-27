@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -79,6 +79,9 @@ class MotionController:
         sensors: SensorHub,
         line_detector: LineDetector,
         *,
+        #: 注入的 spin 回调（timeout 秒）。组合多个节点时由调用方传入
+        #: ``executor.spin_once``，否则默认只驱动传入的 ``node``。
+        spin_fn: Optional[Callable[[float], None]] = None,
         cell_size: float = 0.40,
         cruise_linear: float = 0.15,
         max_angular_z: float = 0.60,
@@ -96,6 +99,7 @@ class MotionController:
         self._base = base
         self._sensors = sensors
         self._line = line_detector
+        self._spin_fn = spin_fn
 
         self.cell_size = float(cell_size)
         self._cruise = float(cruise_linear)
@@ -115,6 +119,13 @@ class MotionController:
         )
 
     # ------------------------------------------------------------ 传感器辅助
+
+    def _spin_once(self, timeout: float) -> None:
+        """驱动一次回调：优先用注入的 spin 回调，否则只转传入的节点。"""
+        if self._spin_fn is not None:
+            self._spin_fn(timeout)
+        else:
+            rclpy.spin_once(self._node, timeout_sec=timeout)
 
     def _latest_image(self) -> Optional[np.ndarray]:
         rgbd = self._sensors.get_rgbd()
@@ -145,24 +156,35 @@ class MotionController:
     # ------------------------------------------------------------ 运动原语
 
     def advance_one_cell(self) -> bool:
-        """沿黑线前进一格。返回是否在容差内到位。"""
+        """沿黑线前进一格（``cell_size``）。"""
+        return self.advance(self.cell_size)
+
+    def advance(self, distance: float, timeout: Optional[float] = None) -> bool:
+        """沿黑线前进指定距离（米），负值为后退。返回是否在容差内到位。
+
+        巡线 PID 只作用于前进方向；后退用于脱离贴墙等场景，不做巡线。
+        """
         start = self._base.get_pose()
         if start is None:
             self._node.get_logger().warn('无里程计数据，无法走格')
             return False
 
+        forward = distance >= 0
+        target = abs(distance) - self._tolerance
+        limit = float(timeout if timeout is not None else self._advance_timeout)
+        speed = self._cruise if forward else -0.5 * self._cruise
+
         self._pid.reset()
         t0 = time.monotonic()
         last_t = t0
         traveled = 0.0
-        target = self.cell_size - self._tolerance
 
-        while rclpy.ok() and (time.monotonic() - t0) < self._advance_timeout:
+        while rclpy.ok() and (time.monotonic() - t0) < limit:
             now = time.monotonic()
             dt = now - last_t
             last_t = now
 
-            if self.is_front_blocked():
+            if forward and self.is_front_blocked():
                 self._base.stop()
                 self._node.get_logger().warn(
                     f'前方 {self.front_range():.2f}m 触发碰撞保护，执行回退'
@@ -171,20 +193,21 @@ class MotionController:
                 return False
 
             steering = 0.0
-            img = self._latest_image()
-            if img is not None:
-                obs = self._line.detect(img)
-                if obs.valid:
-                    steering = self._pid.compute(obs.offset_px, dt)
-                elif self._line.is_lost:
-                    # 丢线保护：停止推进，交由上层处理（重定位或退格）
-                    self._base.stop()
-                    self._node.get_logger().warn(
-                        f'连续丢线 {obs.lost_frames} 帧，停止推进'
-                    )
-                    return False
+            if forward:
+                img = self._latest_image()
+                if img is not None:
+                    obs = self._line.detect(img)
+                    if obs.valid:
+                        steering = self._pid.compute(obs.offset_px, dt)
+                    elif self._line.is_lost:
+                        # 丢线保护：停止推进，交由上层处理（重定位或退格）
+                        self._base.stop()
+                        self._node.get_logger().warn(
+                            f'连续丢线 {obs.lost_frames} 帧，停止推进'
+                        )
+                        return False
 
-            self._base.set_velocity(self._cruise, 0.0, steering)
+            self._base.set_velocity(speed, 0.0, steering)
 
             cur = self._base.get_pose()
             if cur is not None:
@@ -192,14 +215,14 @@ class MotionController:
                 if traveled >= target:
                     break
 
-            rclpy.spin_once(self._node, timeout_sec=0.02)
+            self._spin_once(0.02)
 
         self._base.stop()
-        rclpy.spin_once(self._node, timeout_sec=0.02)
+        self._spin_once(0.02)
         arrived = traveled >= target
         if not arrived:
             self._node.get_logger().warn(
-                f'走格未到位：位移 {traveled:.3f}m（目标 {self.cell_size:.3f}m）'
+                f'未到目标位移：{traveled:.3f}m（目标 {abs(distance):.3f}m）'
             )
         return arrived
 
@@ -230,7 +253,7 @@ class MotionController:
             if abs(wz) < 0.12:
                 wz = math.copysign(0.12, wz)
             self._base.set_velocity(0.0, 0.0, wz)
-            rclpy.spin_once(self._node, timeout_sec=0.02)
+            self._spin_once(0.02)
 
         self._base.stop()
         rclpy.spin_once(self._node, timeout_sec=0.02)
@@ -267,7 +290,7 @@ class MotionController:
                 if abs(moved) >= magnitude - self._tolerance:
                     break
             self._base.set_velocity(0.0, v, 0.0)
-            rclpy.spin_once(self._node, timeout_sec=0.02)
+            self._spin_once(0.02)
 
         self._base.stop()
         rclpy.spin_once(self._node, timeout_sec=0.02)
@@ -287,11 +310,11 @@ class MotionController:
                 if traveled >= back:
                     break
             self._base.set_velocity(-0.10, 0.0, 0.0)
-            rclpy.spin_once(self._node, timeout_sec=0.02)
+            self._spin_once(0.02)
         self._base.stop()
         rclpy.spin_once(self._node, timeout_sec=0.02)
 
     def stop(self) -> None:
         """立即停止（可被外部中断处理调用）。"""
         self._base.stop()
-        rclpy.spin_once(self._node, timeout_sec=0.01)
+        self._spin_once(0.01)
