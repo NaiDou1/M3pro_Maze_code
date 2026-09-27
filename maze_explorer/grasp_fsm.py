@@ -21,6 +21,7 @@ IK 请求约定（沿用现有 demo 实测可用的取值）
 from __future__ import annotations
 
 import math
+import time
 from enum import Enum, auto
 from typing import List, Optional, Sequence
 
@@ -73,9 +74,11 @@ class GraspFSM:
         #: 抬起时的 joint2 角度
         self._lift_joint2 = self._int_param('lift_joint2', 120)
         #: joint5 策略：fixed 用固定值；from_yaw 由方块角点朝向推算
-        self._joint5_mode = str(self._node.declare_parameter(
-            'joint5_mode', 'fixed').value)
+        self._joint5_mode = self._str_param('joint5_mode', 'fixed')
         self._joint5_fixed = self._int_param('joint5_fixed', 90)
+        #: 相机外参未标定时，退化定位所用的方块中心高度（m）。
+        #: 不能取 0——那是地面，会让 IK 去够地面而抓空或撞地。
+        self._block_center_z = self._float_param('block_center_z', 0.03)
 
         self._state = GraspState.IDLE
         self._interrupted = False
@@ -96,6 +99,11 @@ class GraspFSM:
         if not self._node.has_parameter(name):
             self._node.declare_parameter(name, float(default))
         return float(self._node.get_parameter(name).value)
+
+    def _str_param(self, name: str, default: str) -> str:
+        if not self._node.has_parameter(name):
+            self._node.declare_parameter(name, str(default))
+        return str(self._node.get_parameter(name).value)
 
     # ------------------------------------------------------------------ 查询
 
@@ -160,11 +168,18 @@ class GraspFSM:
         self._state = GraspState.SOLVE
         position = target.position_base
         if position is None:
-            # 外参未标定：退化为相机系近似（前=水平距离，左=横向，上=0）
+            # 外参未标定：退化为相机系近似
+            #   前 = 水平距离，左 = -lateral（lateral 正为右），上 = 块心高度
+            # 高度不能取 0（那是地面），否则 IK 会去够地面而抓空或撞地。
             self._node.get_logger().warn(
-                'position_base 为空（相机外参未标定），改用相机系近似定位'
+                'position_base 为空（相机外参未标定），改用相机系近似定位，'
+                f'块心高度取 {self._block_center_z:.3f}m'
             )
-            position = (target.horizontal_distance(), -target.lateral_m, 0.0)
+            position = (
+                target.horizontal_distance(),
+                -target.lateral_m,
+                self._block_center_z,
+            )
 
         fk = self._arm.solve_fk()
         pitch = fk[4] if fk is not None else 0.0
@@ -226,9 +241,8 @@ class GraspFSM:
         self._arm.wait_until_ready()
 
     def _settle(self) -> None:
+        """等待舵机稳定。替代原 demo 里固定的 ``time.sleep(2.5)``，时长可配。"""
         if self._settle_sec > 0:
-            import time
-
             time.sleep(self._settle_sec)
 
     def _sanitize(self, joints: Sequence[float], target: BlockDetection) -> List[int]:

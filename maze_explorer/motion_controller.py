@@ -186,6 +186,8 @@ class MotionController:
         target = abs(distance) - self._tolerance
         limit = float(timeout if timeout is not None else self._advance_timeout)
         speed = self._cruise if forward else -0.5 * self._cruise
+        #: 出发时的前墙距离（前方无墙/无回波则为 None），用于激光交叉验证
+        wall_start = self.front_range() if forward else None
 
         self._pid.reset()
         t0 = time.monotonic()
@@ -225,6 +227,15 @@ class MotionController:
             cur = self._base.get_pose()
             if cur is not None:
                 traveled = math.hypot(cur[0] - start[0], cur[1] - start[1])
+                # 激光交叉验证：出发时若前方有墙，可用「距墙距离的减少量」独立
+                # 估计位移，取两者较小值作保守估计，抑制轮式里程计积分漂移导致
+                # 的冲过头。前方是通道（无回波）时自动跳过。
+                if wall_start is not None:
+                    wall_now = self.front_range()
+                    if wall_now is not None:
+                        wall_traveled = wall_start - wall_now
+                        if wall_traveled > 0:
+                            traveled = min(traveled, wall_traveled)
                 if traveled >= target:
                     break
 

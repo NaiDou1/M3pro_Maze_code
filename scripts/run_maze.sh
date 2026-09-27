@@ -5,7 +5,7 @@
 # 负责三件事：
 #   1. 设置 ROS_DOMAIN_ID=30（本机必须，否则看不到任何话题）
 #   2. source 三个工作区
-#   3. 关闭手柄自启节点（其 JoyState 会让部分节点持续发零速）
+#   3. 关闭手柄自启链路（start_joy_controller.py 等三个进程）
 # 然后启动自研包。
 #
 # 前提（按顺序先手动启动，见 AGENTS.md）：
@@ -25,12 +25,17 @@ source /opt/ros/humble/setup.bash
 source /home/jetson/yahboomcar_ws/install/setup.bash
 source /home/jetson/M3Pro_ws/install/setup.bash 2>/dev/null || true
 
-# 关闭手柄自启节点，避免 JoyState=True 触发其他节点的零速保护
-if pgrep -f yahboom_joy_M3Pro >/dev/null 2>&1; then
-    echo '[run_maze] 关闭手柄自启节点 yahboom_joy_M3Pro'
-    pkill -f yahboom_joy_M3Pro || true
-    sleep 1
-fi
+# 关闭手柄自启链路。joy.sh 会拉起 start_joy_controller.py，后者再启动
+# yahboomcar_joy_launch.py 与 yahboom_joy_M3Pro；其中 autostart 节点会周期性
+# 发布 /cmd_vel 零速、yahboom_joy_M3Pro 会发布 JoyState，两者都会与本体争抢
+# 底盘控制权，必须整条链路一起关掉。
+for pattern in start_joy_controller.py yahboomcar_joy_launch.py yahboom_joy_M3Pro; do
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        echo "[run_maze] 关闭手柄自启进程：$pattern"
+        pkill -f "$pattern" || true
+    fi
+done
+sleep 1
 
 echo '[run_maze] 启动 maze_explorer（Ctrl-C 结束）'
 exec ros2 launch maze_explorer maze_bringup.launch.py "$@"
