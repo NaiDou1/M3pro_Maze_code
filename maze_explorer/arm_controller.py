@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import rclpy
 from arm_interface.srv import ArmKinemarics
@@ -43,8 +43,17 @@ EndPose = Tuple[float, float, float, float, float, float]
 class ArmController(Node):
     """机械臂控制器：关节下发、夹爪开合、IK/FK 求解。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        spin_until_fn: Optional[Callable[[object, float], None]] = None,
+    ) -> None:
         super().__init__('arm_controller')
+        #: 等待服务 future 的注入回调。组合多节点时**必须**传入
+        #: ``executor.spin_until_future_complete``——若直接调用
+        #: ``rclpy.spin_until_future_complete(self, ...)``，会因本节点已被加入
+        #: 外部 executor 而抛 "Node has already been added to an executor"。
+        self._spin_until = spin_until_fn
 
         self.declare_parameter('joints_topic', 'arm6_joints')
         self.declare_parameter('joint_topic', 'arm_joint')
@@ -170,6 +179,17 @@ class ArmController(Node):
         """等待 IK 服务可用（``arm_kin/kin_srv`` 需先启动）。"""
         return self._ik_client.wait_for_service(timeout_sec=timeout)
 
+    def _wait_future(self, future, timeout: float) -> None:
+        """等待服务 future 完成。
+
+        组合多节点时走注入的 ``spin_until_fn``；单节点独立运行时退回
+        ``rclpy.spin_until_future_complete``。
+        """
+        if self._spin_until is not None:
+            self._spin_until(future, timeout)
+        else:
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+
     def solve_ik(
         self,
         x: float,
@@ -188,8 +208,9 @@ class ArmController(Node):
         :param cur_joints: 当前关节角，``None`` 时用最近一次下发的值。
 
         .. note::
-           内部使用 ``spin_until_future_complete``，**不可在回调中调用**，
-           否则会与单线程 executor 互锁。
+           内部通过 ``_wait_future`` 驱动，**不可在回调中调用**（会与单线程
+           executor 互锁）。组合多节点时必须给构造函数注入 ``spin_until_fn``，
+           否则本节点已归属外部 executor 时会抛异常。
         """
         if not self._ik_client.service_is_ready() and not self.wait_for_ik_service(timeout):
             self.get_logger().warn(f'IK 服务 {self._ik_service} 不可用')
@@ -204,7 +225,7 @@ class ArmController(Node):
         req.kin_name = 'ik'
 
         future = self._ik_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        self._wait_future(future, timeout)
         if not future.done() or future.result() is None:
             self.get_logger().warn('IK 求解超时或无解')
             return None
@@ -232,7 +253,7 @@ class ArmController(Node):
         req.cur_joint4, req.cur_joint5, req.cur_joint6 = cur[3], cur[4], cur[5]
 
         future = self._ik_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        self._wait_future(future, timeout)
         if not future.done() or future.result() is None:
             self.get_logger().warn('FK 求解超时或失败')
             return None

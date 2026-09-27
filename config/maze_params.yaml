@@ -45,8 +45,12 @@
     cell_advance_tolerance: 0.03
     #: 朝向容差 (rad)，约 5 度
     yaw_tolerance: 0.0873
-    #: 出厂标定系数（见 calibration 包）
-    odom_angular_scale_correction: 0.75
+    #: 出厂标定系数（见 calibration 包）。语义：真实转角 = 系数 × odom 读数。
+    #: ⚠️ 0.75 是出厂车在 **EKF 链路（/odom）** 上实测的经验值，而本系统航向
+    #:    闭环默认订阅 /odom_raw（STM32 直出，误差特性不同），不能直接沿用。
+    #:    故默认取 1.0（不修正），**必须**用 calibration_tool 的 motion 模式
+    #:    现场实测后填写，否则每次转向都会系统性偏角。
+    odom_angular_scale_correction: 1.0
     odom_linear_scale_correction: 1.0
     #: 单格推进的超时保护 (s)，超时进入 FAULT
     advance_timeout: 12.0

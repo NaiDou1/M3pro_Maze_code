@@ -7,8 +7,13 @@
 * :meth:`MotionController.turn_to_heading` —— 麦轮原地转到目标网格朝向。
 
 .. important::
-   所有原语都是**阻塞式**的，内部自行调用 ``rclpy.spin_once`` 驱动回调。
-   因此**调用方不得再对该节点额外 spin**，否则会出现双重驱动。
+   所有原语都是**阻塞式**的：内部统一通过 :meth:`MotionController._spin_once`
+   驱动回调。组合多个节点时由调用方注入 ``spin_fn``（通常是
+   ``executor.spin_once``）。
+
+   **任何绕过 ``_spin_once`` 直接调用 ``rclpy.spin_once`` 的写法都会导致子节点
+   回调不被驱动**，闭环将读到过期数据（本项目曾因此出现转向失控：yaw 永不更新，
+   车以固定角速度转到超时）。
 """
 
 from __future__ import annotations
@@ -111,8 +116,16 @@ class MotionController:
         self._opening_range = float(opening_min_range)
         self._advance_timeout = float(advance_timeout)
         self._turn_timeout = float(turn_timeout)
-        #: odom 转角系统性缩放系数，需用 calibration_tool motion 模式实测确定
+        #: odom 转角缩放系数：真实转角 = 系数 × odom 读数。
+        #: 需用 calibration_tool 的 motion 模式实测得出，1.0 表示不做修正。
+        #: 注意方向：闭环目标是「目标转角 / 系数」，见 turn_to_heading。
         self._ang_scale = float(angular_scale_correction)
+        if abs(self._ang_scale - 1.0) > 1e-6:
+            self._node.get_logger().warn(
+                f'已启用转向缩放修正 ang_scale={self._ang_scale:.3f}；'
+                '该值应由 calibration_tool motion 模式实测得出，'
+                '否则每次转向都会系统性偏角'
+            )
 
         self._pid = PID(
             kp=line_pid[0], ki=line_pid[1], kd=line_pid[2], out_limit=self._max_wz
@@ -234,8 +247,12 @@ class MotionController:
             return False
 
         target_yaw = GridMapper.heading_yaw(target_heading)
-        # odom 转角存在系统性缩放，按标定系数补偿后闭环
-        desired = angle_diff(target_yaw, cur_yaw) * self._ang_scale
+        # odom 转角存在系统性缩放。calibrate_angular.py 的实测语义是：
+        #     真实转角 = ang_scale × odom 读数
+        # 所以要达成目标真实转角，需要 odom 变化「目标 / ang_scale」。
+        # 注意是**除**不是乘——乘会让 90 度只转 67.5 度（ang_scale=0.75 时），
+        # 逐格累积必然撞墙。
+        desired = angle_diff(target_yaw, cur_yaw) / self._ang_scale
         target = cur_yaw + desired
 
         limit = float(timeout if timeout is not None else self._turn_timeout)
@@ -256,7 +273,7 @@ class MotionController:
             self._spin_once(0.02)
 
         self._base.stop()
-        rclpy.spin_once(self._node, timeout_sec=0.02)
+        self._spin_once(0.02)
         ok = abs(err) <= max(self._yaw_tol, 0.05)
         if not ok:
             self._node.get_logger().warn(
@@ -293,7 +310,7 @@ class MotionController:
             self._spin_once(0.02)
 
         self._base.stop()
-        rclpy.spin_once(self._node, timeout_sec=0.02)
+        self._spin_once(0.02)
         return abs(moved) >= magnitude - self._tolerance
 
     def _emergency_backoff(self, distance: Optional[float] = None) -> None:
@@ -312,7 +329,7 @@ class MotionController:
             self._base.set_velocity(-0.10, 0.0, 0.0)
             self._spin_once(0.02)
         self._base.stop()
-        rclpy.spin_once(self._node, timeout_sec=0.02)
+        self._spin_once(0.02)
 
     def stop(self) -> None:
         """立即停止（可被外部中断处理调用）。"""

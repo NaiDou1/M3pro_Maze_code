@@ -63,7 +63,10 @@ class MissionManager(Node):
         # ---------------- 子节点（共同由 executor 驱动）----------------
         self.base = BaseDriver()
         self.sensors = SensorHub()
-        self.arm = ArmController()
+        # 注入 executor 驱动的 future 等待回调：三个子节点都已加入本节点的
+        # executor，若 ArmController 内部直接 spin_until_future_complete(self)
+        # 会因节点重复加入 executor 而抛异常。
+        self.arm = ArmController(spin_until_fn=self._spin_until_future)
 
         # ---------------- 纯算法模块 ----------------
         self.line_det = LineDetector(
@@ -183,6 +186,14 @@ class MissionManager(Node):
     def _spin(self, timeout: float) -> None:
         """统一 spin 入口：驱动本节点与三个子节点。"""
         self._executor.spin_once(timeout_sec=timeout)
+
+    def _spin_until_future(self, future, timeout: float) -> None:
+        """驱动 executor 直到服务 future 完成（供 ArmController 的 IK/FK 使用）。
+
+        不依赖返回值，调用方统一用 ``future.done()`` 判定是否完成，以兼容
+        不同 rclpy 版本的返回值差异。
+        """
+        self._executor.spin_until_future_complete(future, timeout_sec=timeout)
 
     # ------------------------------------------------------------------ 主循环
 
