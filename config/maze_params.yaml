@@ -45,6 +45,11 @@
     cell_advance_tolerance: 0.03
     #: 朝向容差 (rad)，约 5 度
     yaw_tolerance: 0.0873
+    #: 航向来源：odom_raw（STM32 直出，与位置同源、高频）或 odom（EKF 输出，
+    #: 融合 IMU 航向通常更准，但仅约 6Hz）。
+    #: ⚠️ 换源后必须重新标定 odom_angular_scale_correction——两者误差特性不同。
+    yaw_source: odom_raw
+
     #: 出厂标定系数（见 calibration 包）。语义：真实转角 = 系数 × odom 读数。
     #: ⚠️ 0.75 是出厂车在 **EKF 链路（/odom）** 上实测的经验值，而本系统航向
     #:    闭环默认订阅 /odom_raw（STM32 直出，误差特性不同），不能直接沿用。

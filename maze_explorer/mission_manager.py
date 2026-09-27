@@ -61,7 +61,8 @@ class MissionManager(Node):
         self._declare_params()
 
         # ---------------- 子节点（共同由 executor 驱动）----------------
-        self.base = BaseDriver()
+        # 子节点在进程内创建，收不到 launch 注入的 yaml，故显式转发
+        self.base = BaseDriver(yaw_source=self._yaw_source)
         self.sensors = SensorHub()
         # 注入 executor 驱动的 future 等待回调：三个子节点都已加入本节点的
         # executor，若 ArmController 内部直接 spin_until_future_complete(self)
@@ -141,6 +142,9 @@ class MissionManager(Node):
         self.declare_parameter('yaw_tolerance', 0.0873)
         self.declare_parameter('advance_timeout', 12.0)
         self.declare_parameter('odom_angular_scale_correction', 1.0)
+        #: 航向来源：'odom_raw'（默认，与位置同源、高频）或 'odom'
+        #: （EKF 输出，融合 IMU 航向通常更准，但仅约 6Hz）
+        self.declare_parameter('yaw_source', 'odom_raw')
         # 激光
         self.declare_parameter('opening_min_range', 0.55)
         self.declare_parameter('safety_range', 0.25)
@@ -179,6 +183,7 @@ class MissionManager(Node):
         self._yaw_tolerance = float(p('yaw_tolerance').value)
         self._advance_timeout = float(p('advance_timeout').value)
         self._ang_scale = float(p('odom_angular_scale_correction').value)
+        self._yaw_source = str(p('yaw_source').value)
         self._opening_range = float(p('opening_min_range').value)
         self._safety_range = float(p('safety_range').value)
         self._line_hsv = [int(v) for v in p('line_hsv').value]

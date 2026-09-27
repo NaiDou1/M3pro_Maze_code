@@ -46,11 +46,16 @@ def yaw_from_quaternion(q) -> float:
 class BaseDriver(Node):
     """底盘驱动器：持续发布速度指令，并缓存里程计反馈供上层查询。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, yaw_source: Optional[str] = None) -> None:
         super().__init__('base_driver')
 
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('odom_topic', '/odom_raw')
+        #: 备用航向源话题：EKF 输出（融合 IMU，航向通常比轮式直出更准，但仅 6Hz）
+        self.declare_parameter('alt_odom_topic', '/odom')
+        #: 航向来源：'odom_raw'（默认，与位置同源、高频）或 'odom'（EKF，航向更准）。
+        #: ⚠️ 两者误差特性不同，odom_angular_scale_correction 必须按所选源现场重标
+        self.declare_parameter('yaw_source', 'odom_raw')
         #: 重发频率，必须 >=10Hz 才能维持下位机运动（无超时保护）
         self.declare_parameter('publish_rate_hz', 20.0)
         #: 超过该时长未收到里程计则告警（只告警一次，避免刷屏）
@@ -58,6 +63,13 @@ class BaseDriver(Node):
 
         cmd_topic = str(self.get_parameter('cmd_vel_topic').value)
         odom_topic = str(self.get_parameter('odom_topic').value)
+        alt_odom_topic = str(self.get_parameter('alt_odom_topic').value)
+        # 构造参数优先：本节点由 mission_manager 在进程内创建，收不到 launch
+        # 注入的 yaml，故需由调用方把值转发进来
+        self._yaw_source = str(
+            yaw_source if yaw_source is not None
+            else self.get_parameter('yaw_source').value
+        )
         rate_hz = float(self.get_parameter('publish_rate_hz').value)
         self._odom_timeout = float(self.get_parameter('odom_timeout_sec').value)
 
@@ -70,6 +82,7 @@ class BaseDriver(Node):
         self._lock = threading.Lock()
         self._cmd = Twist()  # 目标速度，默认全 0
         self._pose: Optional[Pose] = None
+        self._alt_yaw: Optional[float] = None
         self._last_odom_ts = 0.0
         self._stale_warned = False
 
@@ -77,11 +90,30 @@ class BaseDriver(Node):
         self._sub = self.create_subscription(
             Odometry, odom_topic, self._on_odom, 50
         )
+        # 备用航向源：只取 yaw，不参与位置解算
+        self._alt_sub = self.create_subscription(
+            Odometry, alt_odom_topic, self._on_alt_odom, 10
+        )
         self.create_timer(1.0 / rate_hz, self._tick)
+
+        if self._yaw_source not in ('odom_raw', 'odom'):
+            self.get_logger().warn(
+                f'yaw_source={self._yaw_source!r} 非法，回退为 odom_raw'
+            )
+            self._yaw_source = 'odom_raw'
 
         self.get_logger().info(
             f'BaseDriver 就绪 | cmd_vel={cmd_topic} | odom={odom_topic} | {rate_hz:.0f}Hz'
         )
+        if self._yaw_source == 'odom':
+            self.get_logger().info(
+                f'航向来源 yaw_source=odom（EKF，仅约 6Hz）| 备用源 {alt_odom_topic}；'
+                '换源后必须用 calibration_tool motion 模式重标角速度系数'
+            )
+        else:
+            self.get_logger().info(
+                f'航向来源 yaw_source=odom_raw（与位置同源）| 备用源 {alt_odom_topic}'
+            )
 
     # ------------------------------------------------------------------ 指令
 
@@ -111,8 +143,15 @@ class BaseDriver(Node):
             return self._pose
 
     def get_yaw(self) -> Optional[float]:
-        """返回当前偏航角（rad），无数据时 ``None``。"""
+        """返回当前偏航角（rad），无数据时 ``None``。
+
+        按 ``yaw_source`` 选择来源：``odom_raw``（默认）取主里程计；``odom``
+        优先取 EKF 备用源（融合 IMU，航向更准），其尚无数据时退回主源，以免
+        上电初期返回 ``None`` 导致转向原语直接失败。
+        """
         with self._lock:
+            if self._yaw_source == 'odom' and self._alt_yaw is not None:
+                return self._alt_yaw
             return None if self._pose is None else self._pose[2]
 
     def odom_age(self) -> float:
@@ -131,6 +170,12 @@ class BaseDriver(Node):
             self._pose = (p.x, p.y, yaw)
             self._last_odom_ts = time.monotonic()
             self._stale_warned = False
+
+    def _on_alt_odom(self, msg: Odometry) -> None:
+        """备用航向源回调：只取 yaw，不使用其位置。"""
+        yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        with self._lock:
+            self._alt_yaw = yaw
 
     def publish_now(self) -> None:
         """立即发布当前缓存的速度指令，不等定时器周期。"""
