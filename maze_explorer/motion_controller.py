@@ -103,6 +103,12 @@ class MotionController:
         scan_timeout: float = 0.5,
         #: 相机保鲜阈值（秒）：超过即视为失效，禁止前进（循迹依赖它）
         vision_timeout: float = 2.0,
+        #: 失效后先自旋等待恢复的时长（秒），仍失效才中止动作。
+        #: 必要性：SensorHub 首帧同步 RGB-D 实测 1.38~1.88s（DDS 发现 + 配对），
+        #: 且机械臂动作期间 time.sleep 不 spin 会让数据"变陈旧"——没有这段宽限，
+        #: 启动瞬间必然误判失效（2026-10-04 实测：任务在 EXPLORE 首步即 FAULT）。
+        #: 取 2.0s 以覆盖实测最坏值。
+        sensor_recover_wait: float = 2.0,
     ) -> None:
         self._node = node
         self._base = base
@@ -122,6 +128,7 @@ class MotionController:
         self._turn_timeout = float(turn_timeout)
         self._scan_timeout = float(scan_timeout)
         self._vision_timeout = float(vision_timeout)
+        self._recover_wait = float(sensor_recover_wait)
         #: odom 转角缩放系数：真实转角 = 系数 × odom 读数。
         #: 需用 calibration_tool 的 motion 模式实测得出，1.0 表示不做修正。
         #: 注意方向：闭环目标是「目标转角 / 系数」，见 turn_to_heading。
@@ -185,8 +192,27 @@ class MotionController:
             return False
         return True
 
+    def wait_until_healthy(
+        self, need_vision: bool = True, timeout: Optional[float] = None
+    ) -> bool:
+        """自旋等待传感器恢复新鲜；返回是否在 ``timeout`` 内可用。
+
+        这是"失效即停"的宽限环节：数据陈旧未必代表硬件坏了——机械臂动作期间
+        不 spin 就会让缓存变旧，SensorHub 首帧同步也需要 1.6~1.8s。等待期间
+        持续 spin，让回调有机会把数据刷新。
+        """
+        limit = self._recover_wait if timeout is None else float(timeout)
+        if self.sensors_ok(need_vision):
+            return True
+        deadline = time.monotonic() + limit
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._spin_once(0.05)
+            if self.sensors_ok(need_vision):
+                return True
+        return False
+
     def _stop_if_unhealthy(self, need_vision: bool) -> bool:
-        """传感器失效时立即停车并返回 ``True``（调用方应放弃本次动作）。
+        """传感器失效时停车；给一次恢复机会，仍失效才返回 ``True``（放弃动作）。
 
         为什么必须硬失败：激光失效时 ``sector_min_range`` 返回 ``None``，而
         ``is_path_clear`` 与碰撞保护都把 ``None`` 当"通畅"；相机失效时循迹偏差
@@ -194,7 +220,13 @@ class MotionController:
         """
         if self.sensors_ok(need_vision):
             return False
+        # 先停车（无论后续是否恢复，动作都已经中断）
         self._base.stop()
+        if self.wait_until_healthy(need_vision, timeout=self._recover_wait):
+            self._node.get_logger().info(
+                f'传感器短暂失效后已恢复（等待上限 {self._recover_wait:.1f}s），继续动作'
+            )
+            return False
         parts = [f'激光年龄 {self.scan_age():.2f}s（阈值 {self._scan_timeout:.2f}s）']
         if need_vision:
             parts.append(

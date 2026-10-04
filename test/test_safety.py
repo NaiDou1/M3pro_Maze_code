@@ -58,6 +58,10 @@ class FakeBase:
         """是否出现过非零速度指令。"""
         return any(cmd != (0.0, 0.0, 0.0) for cmd in self.commands)
 
+    def last_is_zero(self) -> bool:
+        """最后一条速度指令是否为全 0（用于验证"放弃动作前先停车"）。"""
+        return bool(self.commands) and self.commands[-1] == (0.0, 0.0, 0.0)
+
 
 class FakeSensors:
     """最小传感器桩：只提供保鲜度查询。"""
@@ -71,6 +75,22 @@ class FakeSensors:
 
     def rgbd_age(self) -> float:
         return self.rgbd
+
+
+class RecoveringSensors(FakeSensors):
+    """失效后能在若干次 spin 内恢复新鲜的桩，用于测"宽限等待"。"""
+
+    def __init__(self, scan_age: float, rgbd_age: float, recover_after: int) -> None:
+        super().__init__(scan_age, rgbd_age)
+        self.spins = 0
+        self.recover_after = int(recover_after)
+
+    def tick(self) -> None:
+        """模拟一次 spin：回调收到新数据，保鲜度恢复。"""
+        self.spins += 1
+        if self.spins >= self.recover_after:
+            self.scan = 0.0
+            self.rgbd = 0.0
 
 
 class FakeLogger:
@@ -233,13 +253,16 @@ def _make_controller(
     sensors: FakeSensors,
     scan_timeout: float = 0.5,
     vision_timeout: float = 2.0,
+    recover_wait: float = 1.5,
+    spin_fn=None,
 ) -> Tuple[MotionController, FakeNode]:
     node = FakeNode()
     controller = MotionController(
         node, base, sensors, None,  # type: ignore[arg-type]
-        spin_fn=lambda _timeout: None,
+        spin_fn=spin_fn if spin_fn is not None else (lambda _timeout: None),
         scan_timeout=scan_timeout,
         vision_timeout=vision_timeout,
+        sensor_recover_wait=recover_wait,
     )
     return controller, node
 
@@ -324,3 +347,53 @@ def test_scan_age_infinite_without_data() -> None:
 
     assert controller.scan_age() == math.inf
     assert controller.sensors_ok() is False
+
+
+# --------------------------------- 四、失效后的宽限等待（启动竞态修复）
+
+def test_stop_if_unhealthy_waits_for_recovery(ros_context) -> None:  # noqa: ARG001
+    """短暂失效不应直接放弃动作：等待期内恢复就放行。
+
+    背景（2026-10-04 实测）：SensorHub 首帧同步 RGB-D 需 1.6~1.8s，
+    没有宽限会在 EXPLORE 第一步就误判"相机失效"并连环失败进 FAULT。
+    """
+    sensors = RecoveringSensors(scan_age=5.0, rgbd_age=9.0, recover_after=2)
+    controller, _ = _make_controller(
+        FakeBase(), sensors, recover_wait=2.0, spin_fn=lambda _t: sensors.tick()
+    )
+    assert controller.sensors_ok() is False
+
+    assert controller._stop_if_unhealthy(need_vision=True) is False  # noqa: SLF001
+    assert controller.sensors_ok() is True
+    assert sensors.spins >= 2
+
+
+def test_stop_if_unhealthy_aborts_when_never_recovers(ros_context) -> None:  # noqa: ARG001
+    """始终不恢复才放弃动作，并给出年龄明细。"""
+    base = FakeBase()
+    controller, node = _make_controller(
+        base, FakeSensors(scan_age=5.0, rgbd_age=9.0), recover_wait=0.2
+    )
+
+    assert controller._stop_if_unhealthy(need_vision=True) is True  # noqa: SLF001
+    assert base.last_is_zero() is True, '放弃动作前必须先停车'
+    assert any('传感器数据失效' in msg for msg in node.logger.warnings)
+
+
+def test_wait_until_healthy_times_out_without_recovery(ros_context) -> None:  # noqa: ARG001
+    """wait_until_healthy 在超时后返回 False，不无限等待。"""
+    controller, _ = _make_controller(
+        FakeBase(), FakeSensors(scan_age=5.0), recover_wait=0.2
+    )
+    started = time.monotonic()
+    assert controller.wait_until_healthy(need_vision=False, timeout=0.3) is False
+    assert time.monotonic() - started < 3.0, '超时保护失效，等待过久'
+
+
+def test_wait_until_healthy_returns_true_when_already_fresh() -> None:
+    """本来就新鲜时立即返回 True，不做任何等待（快路径）。"""
+    controller, _ = _make_controller(FakeBase(), FakeSensors())
+
+    started = time.monotonic()
+    assert controller.wait_until_healthy(need_vision=True, timeout=5.0) is True
+    assert time.monotonic() - started < 0.1

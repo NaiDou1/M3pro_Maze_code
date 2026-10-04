@@ -132,6 +132,7 @@ class MissionManager(Node):
             angular_scale_correction=self._ang_scale,
             scan_timeout=self._scan_timeout,
             vision_timeout=self._vision_timeout,
+            sensor_recover_wait=self._recover_wait,
         )
         self.grasp = GraspFSM(self, self.arm)
 
@@ -176,6 +177,12 @@ class MissionManager(Node):
         self.declare_parameter('vision_timeout', 2.0)
         #: 传感器失效后的等待上限（秒）：先给一次恢复机会，仍失效才判 FAULT
         self.declare_parameter('sensor_wait_timeout', 3.0)
+        #: 传感器短暂失效后允许自旋等待恢复的时长（秒），仍失效才放弃动作
+        self.declare_parameter('sensor_recover_wait', 2.0)
+        #: INIT 阶段等相机首帧的上限（秒）：SensorHub 首帧同步实测需 1.6~1.8s
+        self.declare_parameter('init_sensor_timeout', 15.0)
+        #: 走格/转向失败后到下次重试的退避时长（秒）
+        self.declare_parameter('retry_pause_sec', 0.5)
         #: 航向来源：'odom_raw'（默认，与位置同源、高频）或 'odom'
         #: （EKF 输出，融合 IMU 航向通常更准，但仅约 6Hz）
         self.declare_parameter('yaw_source', 'odom_raw')
@@ -221,6 +228,9 @@ class MissionManager(Node):
         self._scan_timeout = float(p('scan_timeout').value)
         self._vision_timeout = float(p('vision_timeout').value)
         self._sensor_wait_timeout = float(p('sensor_wait_timeout').value)
+        self._recover_wait = float(p('sensor_recover_wait').value)
+        self._init_sensor_timeout = float(p('init_sensor_timeout').value)
+        self._retry_pause_sec = float(p('retry_pause_sec').value)
         self._yaw_source = str(p('yaw_source').value)
         self._opening_range = float(p('opening_min_range').value)
         self._safety_range = float(p('safety_range').value)
@@ -302,11 +312,26 @@ class MissionManager(Node):
         self.arm.send_joints(line_pose)
         self.arm.wait_until_ready()
 
+        # 等相机首帧：SensorHub 首帧同步 RGB-D 实测需 1.6~1.8s（DDS 发现 + 配对），
+        # 而上面两条机械臂指令是 time.sleep（不 spin），全程没有回调机会。
+        # 不等它，EXPLORE 第一步就会因"相机年龄 inf"被安全门禁拦下（实测 FAULT）。
+        if not self.motion.wait_until_healthy(
+            need_vision=True, timeout=self._init_sensor_timeout
+        ):
+            self.get_logger().error(
+                f'{self._init_sensor_timeout:.0f}s 内未取得同步 RGB-D'
+                f'（相机年龄 {self.motion.vision_age():.1f}s），无视觉无法巡线，任务中止'
+            )
+            return MissionState.FAULT
+
         # 以里程计当前朝向初始化机器人朝向
         yaw = self.base.get_yaw()
         if yaw is not None:
             self.mapper.robot_heading = self.mapper.yaw_to_heading(yaw)
-        self.get_logger().info(f'初始化完成，朝向 {self.mapper.robot_heading}')
+        self.get_logger().info(
+            f'初始化完成，朝向 {self.mapper.robot_heading}'
+            f'（激光 {self.motion.scan_age():.2f}s，相机 {self.motion.vision_age():.2f}s）'
+        )
         return MissionState.EXPLORE
 
     def _run_explore(self) -> MissionState:
@@ -355,12 +380,14 @@ class MissionManager(Node):
         if heading != decision.direction:
             if not self.motion.turn_to_heading(decision.direction):
                 self._failed_advances += 1
+                self._retry_pause()
                 return self._fault_if_repeated()
             self.mapper.robot_heading = decision.direction
 
         if not self.motion.advance_one_cell():
             self._failed_advances += 1
             self.get_logger().warn(f'走格失败第 {self._failed_advances} 次')
+            self._retry_pause()
             return self._fault_if_repeated()
 
         self._failed_advances = 0
@@ -469,6 +496,15 @@ class MissionManager(Node):
             self.get_logger().error('连续 3 次走格/转向失败，进入 FAULT')
             return MissionState.FAULT
         return MissionState.EXPLORE
+
+    def _retry_pause(self) -> None:
+        """失败后到下次重试之间的退避与自旋。
+
+        必要性：没有它时 3 次"走格失败"实测在 **11 毫秒**内烧完（EXPLORE 循环
+        不 spin 就再次进入），任何瞬时异常都会直接判 FAULT；这段停顿既给传感器
+        恢复的机会，也让重试之间有真实的观测间隔。
+        """
+        self._spin(self._retry_pause_sec)
 
     def _wait_for_fresh_scan(self) -> bool:
         """等待激光恢复新鲜；返回是否可用。
