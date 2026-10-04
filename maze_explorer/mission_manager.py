@@ -503,8 +503,15 @@ class MissionManager(Node):
         必要性：没有它时 3 次"走格失败"实测在 **11 毫秒**内烧完（EXPLORE 循环
         不 spin 就再次进入），任何瞬时异常都会直接判 FAULT；这段停顿既给传感器
         恢复的机会，也让重试之间有真实的观测间隔。
+
+        注意：必须用"墙钟循环 + 多次 spin_once"，**不能**只调一次
+        ``self._spin(0.5)``——``spin_once`` 语义是"最多等 0.5s，有回调就立即
+        返回"，本机 odom 与 20Hz 定时器一直在刷，单次调用几乎立刻返回
+        （2026-10-04 实测：退避形同虚设，3 次失败仍在 26ms 内烧完）。
         """
-        self._spin(self._retry_pause_sec)
+        deadline = time.monotonic() + self._retry_pause_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._spin(0.05)
 
     def _wait_for_fresh_scan(self) -> bool:
         """等待激光恢复新鲜；返回是否可用。

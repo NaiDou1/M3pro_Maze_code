@@ -102,7 +102,9 @@ class CalibrationTool(Node):
         # 运动标定
         self._motion_start_pose: Optional[Tuple[float, float, float]] = None
 
-        self.get_logger().info(f'CalibrationTool 启动 | mode={self.mode} | config={self._config_dir}')
+        self.get_logger().info(
+            f'CalibrationTool 启动 | mode={self.mode} | config={self._config_dir}'
+        )
 
     # ------------------------------------------------------------------ 工具
 
@@ -236,16 +238,42 @@ class CalibrationTool(Node):
         cv2.destroyAllWindows()
 
     def _flush_pending(self) -> None:
-        path = self._config_dir / 'hsv_params.yaml'
         if not self._pending:
             self.get_logger().warn('没有待保存的阈值')
             return
         for key, values in self._pending.items():
-            if self._update_yaml_line(path, key, values):
+            if self._write_config_key('hsv_params.yaml', key, values):
                 self.get_logger().info(f'已写入 {key} = {values}')
             else:
-                self.get_logger().warn(f'未能写入 {key}，请检查 {path}')
+                self.get_logger().warn(f'未能写入 {key}，请检查 {self._config_dir}')
         self._pending.clear()
+
+    @staticmethod
+    def _install_config_dir() -> Optional[Path]:
+        """install/share 下的 config 目录；未安装时返回 ``None``。"""
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            return Path(get_package_share_directory('maze_explorer')) / 'config'
+        except Exception:  # noqa: BLE001 - 未安装（纯源码运行）时忽略
+            return None
+
+    def _write_config_key(self, filename: str, key: str, values: List) -> bool:
+        """写入配置：源码 config 为权威，同时镜像到 install 副本。
+
+        为什么必须镜像：launch 读的是 ``install/share/maze_explorer/config``，
+        而本工具写的是源码目录。只写源码时，标定结果**必须 colcon build 之后
+        才生效**——这是极易踩的坑（标了半天车还是老样子），故在此一并写。
+        """
+        ok = self._update_yaml_line(self._config_dir / filename, key, values)
+        install_dir = self._install_config_dir()
+        if install_dir is not None and install_dir != self._config_dir:
+            target = install_dir / filename
+            if target.is_file() and self._update_yaml_line(target, key, values):
+                self.get_logger().info(f'已同步到 install 副本：{target}')
+            else:
+                self.get_logger().warn(f'install 副本未同步（{target}），下次 colcon build 会带上')
+        return ok
 
     # -------------------------------------------------- 模式二：巡线姿态标定
 
@@ -289,11 +317,10 @@ class CalibrationTool(Node):
             elif k == ord('p'):
                 self.get_logger().info(f'当前关节角 {self._joints}')
             elif k == ord('P'):
-                path = self._config_dir / 'arm_poses.yaml'
-                if self._update_yaml_line(path, 'line_pose', self._joints):
+                if self._write_config_key('arm_poses.yaml', 'line_pose', self._joints):
                     self.get_logger().info(f'已保存 line_pose = {self._joints}')
                 else:
-                    self.get_logger().warn(f'保存失败，请检查 {path}')
+                    self.get_logger().warn(f'保存失败，请检查 {self._config_dir}')
 
             rclpy.spin_once(self, timeout_sec=0.01)
 
@@ -314,9 +341,13 @@ class CalibrationTool(Node):
     # -------------------------------------------------- 模式三：运动标定自测
 
     def run_motion(self) -> None:
-        """命令行交互式自测：走一格 / 转 90 度，打印里程计实测值。"""
+        """命令行交互式自测：开环走一段 / 开环转一段，用命令值反推里程计系数。"""
         self.get_logger().info(
-            'w=前进1格(0.4m) a=左转90 d=右转90 s=横移1格 q=退出'
+            'w=前进(0.15m/s×3s) a=左转(0.5rad/s×3s) d=右转 s=横移(0.12m/s×3s) q=退出'
+        )
+        self.get_logger().info(
+            '说明：角速度系数用「命令角速度×时长」作基准（开环），'
+            '故请确认底盘能达到指令角速度；更可靠可用地面基准复测'
         )
         while rclpy.ok():
             cmd = input('[w/a/d/s/q] > ').strip().lower()
@@ -331,15 +362,23 @@ class CalibrationTool(Node):
             else:
                 continue
 
+    #: 运动标定的固定时长（秒）与速度，命令值 = 速度 × 时长
+    TEST_DURATION = 3.0
+
     def _test_advance(self, linear: float, lateral: float) -> None:
-        """按 0.4m 目标距离走一格，比较里程计位移与理论值。"""
+        """开环走一段，用「命令速度 × 时长」作基准反推线速度系数。
+
+        旧实现拿 0.4m（一格）当基准，但 0.15m/s × 3s 实际是 0.45m，
+        建议值会系统性偏大 12.5%；此处按命令位移计算。
+        """
         start = self._current_pose()
         if start is None:
             self.get_logger().warn('尚未收到里程计')
             return
-        self.get_logger().info('开始走格，约 3 秒...')
+        commanded = math.hypot(linear, lateral) * self.TEST_DURATION
+        self.get_logger().info(f'开始开环运动 {self.TEST_DURATION:.1f}s（命令位移 {commanded:.3f}m）...')
         t0 = time.monotonic()
-        while time.monotonic() - t0 < 3.0 and rclpy.ok():
+        while time.monotonic() - t0 < self.TEST_DURATION and rclpy.ok():
             self._publish_vel(linear, lateral, 0.0)
             rclpy.spin_once(self, timeout_sec=0.05)
         self._publish_vel(0.0, 0.0, 0.0)
@@ -353,26 +392,34 @@ class CalibrationTool(Node):
             self.get_logger().warn('位移过小，请检查底盘是否响应 /cmd_vel')
             return
         self.get_logger().info(
-            f'位移 = {dist:.3f} m（目标 0.400），dx={dx:+.3f} dy={dy:+.3f}，'
-            f'linear_scale_correction 建议 = {0.4 / dist:.3f}'
+            f'命令位移 {commanded:.3f}m，里程计读数 {dist:.3f}m（dx={dx:+.3f} dy={dy:+.3f}）'
+        )
+        self.get_logger().info(
+            f'odom_linear_scale_correction 建议 = {commanded / dist:.3f}'
+            '（⚠️ 该系数目前未被任务代码使用，仅作记录）'
         )
 
     def _test_turn(self, angle_deg: float) -> None:
-        """按目标角度原地旋转，比较里程计实际转角并给出角速度标定系数。"""
+        """开环转角标定：固定角速度转固定时长，反推 ``odom_angular_scale_correction``。
+
+        为什么必须开环：旧实现以里程计为停止条件、再用里程计去"测量"，
+        得到的比值恒 ≈1（在 5° 容差下会打印 ≈0.94 的假建议），**测不出真实误差**。
+        开环下"真实转角"由「角速度 × 时长」给出（假定底盘达到指令角速度），
+        与里程计读数之比才是系数：真实转角 = 系数 × odom 读数。
+        """
         start = self._current_pose()
         if start is None:
             self.get_logger().warn('尚未收到里程计')
             return
-        target = math.radians(angle_deg)
-        wz = math.copysign(0.5, target)
-        tolerance = math.radians(5.0)
+        speed = 0.5
+        wz = math.copysign(speed, angle_deg)
+        commanded = speed * self.TEST_DURATION          # 命令转角（rad）
+        self.get_logger().info(
+            f'开始开环旋转 {self.TEST_DURATION:.1f}s（命令 {speed:.2f}rad/s × '
+            f'{self.TEST_DURATION:.1f}s = {math.degrees(commanded):+.1f}°）...'
+        )
         t0 = time.monotonic()
-        while time.monotonic() - t0 < 8.0 and rclpy.ok():
-            cur = self._current_pose()
-            if cur is not None:
-                turned = self._angle_diff(cur[2], start[2])
-                if abs(turned) >= abs(target) - tolerance:
-                    break
+        while time.monotonic() - t0 < self.TEST_DURATION and rclpy.ok():
             self._publish_vel(0.0, 0.0, wz)
             rclpy.spin_once(self, timeout_sec=0.05)
         self._publish_vel(0.0, 0.0, 0.0)
@@ -381,11 +428,18 @@ class CalibrationTool(Node):
         end = self._current_pose()
         if end is None:
             return
-        actual = math.degrees(self._angle_diff(end[2], start[2]))
-        ratio = actual / angle_deg if abs(angle_deg) > 1e-6 else float('nan')
+        odom_delta = self._angle_diff(end[2], start[2])
+        if abs(odom_delta) < 1e-3:
+            self.get_logger().warn('里程计转角几乎为 0，请检查底盘是否响应 /cmd_vel')
+            return
+        suggested = commanded / odom_delta
         self.get_logger().info(
-            f'实际转角 = {actual:+.1f} 度（目标 {angle_deg:+.1f}），'
-            f'angular_scale_correction 建议 = {ratio:.3f}'
+            f'命令转角 {math.degrees(commanded):+.1f}°，里程计读数 '
+            f'{math.degrees(odom_delta):+.1f}°'
+        )
+        self.get_logger().info(
+            f'odom_angular_scale_correction 建议 = {suggested:.3f}'
+            '（填入 config/maze_params.yaml 后无需重建，工具已同步 install 副本）'
         )
 
     @staticmethod
