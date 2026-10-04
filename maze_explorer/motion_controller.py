@@ -99,6 +99,10 @@ class MotionController:
         advance_timeout: float = 12.0,
         turn_timeout: float = 8.0,
         angular_scale_correction: float = 1.0,
+        #: 激光保鲜阈值（秒）：超过即视为失效，禁止移动
+        scan_timeout: float = 0.5,
+        #: 相机保鲜阈值（秒）：超过即视为失效，禁止前进（循迹依赖它）
+        vision_timeout: float = 2.0,
     ) -> None:
         self._node = node
         self._base = base
@@ -116,6 +120,8 @@ class MotionController:
         self._opening_range = float(opening_min_range)
         self._advance_timeout = float(advance_timeout)
         self._turn_timeout = float(turn_timeout)
+        self._scan_timeout = float(scan_timeout)
+        self._vision_timeout = float(vision_timeout)
         #: odom 转角缩放系数：真实转角 = 系数 × odom 读数。
         #: 需用 calibration_tool 的 motion 模式实测得出，1.0 表示不做修正。
         #: 注意方向：闭环目标是「目标转角 / 系数」，见 turn_to_heading。
@@ -143,6 +149,61 @@ class MotionController:
     def _latest_image(self) -> Optional[np.ndarray]:
         rgbd = self._sensors.get_rgbd()
         return None if rgbd is None else rgbd[0]
+
+    # ------------------------------------------------------------ 传感器健康
+
+    def _sensor_age(self, name: str) -> float:
+        """读取某项传感器数据的年龄（秒）。
+
+        ``name`` 取 ``'scan_age'`` 或 ``'rgbd_age'``。传感器对象未提供该接口时
+        返回 0（视为健康）——这样纯逻辑单测可以传桩对象，不必搭 ROS 运行时。
+        """
+        getter = getattr(self._sensors, name, None)
+        if getter is None:
+            return 0.0
+        try:
+            return float(getter())
+        except Exception:  # noqa: BLE001 - 健康检查本身不应影响主流程
+            return 0.0
+
+    def scan_age(self) -> float:
+        """激光数据年龄（秒）；无数据为 ``inf``。"""
+        return self._sensor_age('scan_age')
+
+    def vision_age(self) -> float:
+        """相机数据年龄（秒）；无数据为 ``inf``。"""
+        return self._sensor_age('rgbd_age')
+
+    def sensors_ok(self, need_vision: bool = True) -> bool:
+        """传感器是否新鲜可用。
+
+        :param need_vision: 是否同时要求相机新鲜（前进循迹需要，原地转向不需要）。
+        """
+        if self.scan_age() > self._scan_timeout:
+            return False
+        if need_vision and self.vision_age() > self._vision_timeout:
+            return False
+        return True
+
+    def _stop_if_unhealthy(self, need_vision: bool) -> bool:
+        """传感器失效时立即停车并返回 ``True``（调用方应放弃本次动作）。
+
+        为什么必须硬失败：激光失效时 ``sector_min_range`` 返回 ``None``，而
+        ``is_path_clear`` 与碰撞保护都把 ``None`` 当"通畅"；相机失效时循迹偏差
+        恒为 0，车会闷头直行。两者都会让"保护"退化成"放任"，因此宁可停车。
+        """
+        if self.sensors_ok(need_vision):
+            return False
+        self._base.stop()
+        parts = [f'激光年龄 {self.scan_age():.2f}s（阈值 {self._scan_timeout:.2f}s）']
+        if need_vision:
+            parts.append(
+                f'相机年龄 {self.vision_age():.2f}s（阈值 {self._vision_timeout:.2f}s）'
+            )
+        self._node.get_logger().warn(
+            '传感器数据失效，已停车并放弃本次动作：' + '，'.join(parts)
+        )
+        return True
 
     def front_range(self) -> Optional[float]:
         """正前方最近障碍距离（米）。"""
@@ -176,13 +237,20 @@ class MotionController:
         """沿黑线前进指定距离（米），负值为后退。返回是否在容差内到位。
 
         巡线 PID 只作用于前进方向；后退用于脱离贴墙等场景，不做巡线。
+
+        安全门禁：**传感器不新鲜一律不动**。前进需要激光（碰撞保护）与相机
+        （循迹）；后退只需要激光。门禁在动作开始前与每个控制周期内各查一次，
+        因此行进途中掉线也会立刻停车。
         """
+        forward = distance >= 0
+        if self._stop_if_unhealthy(need_vision=forward):
+            return False
+
         start = self._base.get_pose()
         if start is None:
             self._node.get_logger().warn('无里程计数据，无法走格')
             return False
 
-        forward = distance >= 0
         target = abs(distance) - self._tolerance
         limit = float(timeout if timeout is not None else self._advance_timeout)
         speed = self._cruise if forward else -0.5 * self._cruise
@@ -198,6 +266,10 @@ class MotionController:
             now = time.monotonic()
             dt = now - last_t
             last_t = now
+
+            # 行进途中掉线也要立刻停：否则保护退化为"放任"
+            if self._stop_if_unhealthy(need_vision=forward):
+                return False
 
             if forward and self.is_front_blocked():
                 self._base.stop()
@@ -251,7 +323,14 @@ class MotionController:
         return arrived
 
     def turn_to_heading(self, target_heading: str, timeout: Optional[float] = None) -> bool:
-        """原地旋转到目标网格朝向（'N'/'E'/'S'/'W'）。"""
+        """原地旋转到目标网格朝向（'N'/'E'/'S'/'W'）。
+
+        安全门禁：激光失效时**不启动转向**（转向本身只看 yaw，但盲转意味着
+        转完后无法确认周围环境）。门禁放在动作开始前，避免把车停在半路。
+        """
+        if self._stop_if_unhealthy(need_vision=False):
+            return False
+
         cur_yaw = self._base.get_yaw()
         if cur_yaw is None:
             self._node.get_logger().warn('无里程计数据，无法转向')
@@ -296,8 +375,11 @@ class MotionController:
         """横移指定距离（米），正值为向左，用里程计闭环。
 
         麦轮横移误差比纵向大，仅用于抓取对位等小距离场景。位移按车体左方向
-        在世界系中投影后累加，故不受当前朝向影响。
+        在世界系中投影后累加，故不受当前朝向影响。传感器不新鲜时不动。
         """
+        if self._stop_if_unhealthy(need_vision=False):
+            return False
+
         start = self._base.get_pose()
         yaw = self._base.get_yaw()
         if start is None or yaw is None:

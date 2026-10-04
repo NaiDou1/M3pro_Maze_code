@@ -72,6 +72,7 @@ class SensorHub(Node):
         self._depth: Optional[np.ndarray] = None
         self._rgbd_ts = 0.0
         self._scan: Optional[LaserScan] = None
+        self._scan_ts = 0.0
 
         # 帧率统计（只用于低频 INFO 日志，不逐帧打印）
         self._frame_count = 0
@@ -117,6 +118,18 @@ class SensorHub(Node):
         """返回最近一帧激光数据；无数据返回 ``None``。"""
         with self._lock:
             return self._scan
+
+    def scan_age(self) -> float:
+        """距最近一帧激光的时长（秒）；从未收到返回 ``inf``。
+
+        用途：激光失效时 ``sector_min_range`` 会返回 ``None``，而
+        ``is_path_clear`` / 碰撞保护都把 ``None`` 当作"通畅"。因此**必须先查
+        保鲜度**再相信测距结果，否则雷达掉线会被误判成"前方无阻挡"。
+        """
+        with self._lock:
+            if self._scan_ts <= 0.0:
+                return math.inf
+            return time.monotonic() - self._scan_ts
 
     def sector_min_range(self, angle_deg: float, half_width_deg: float) -> Optional[float]:
         """取指定角度扇区内的**最近**有效距离（米）。
@@ -174,6 +187,7 @@ class SensorHub(Node):
     def _on_scan(self, msg: LaserScan) -> None:
         with self._lock:
             self._scan = msg
+            self._scan_ts = time.monotonic()
 
     def _log_rate(self) -> None:
         with self._lock:

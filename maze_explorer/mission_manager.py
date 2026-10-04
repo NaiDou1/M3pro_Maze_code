@@ -23,10 +23,9 @@
 
 from __future__ import annotations
 
-import math
 import time
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -84,7 +83,10 @@ class MissionManager(Node):
 
         # ---------------- 子节点（共同由 executor 驱动）----------------
         # 子节点在进程内创建，收不到 launch 注入的 yaml，故显式转发
-        self.base = BaseDriver(yaw_source=self._yaw_source)
+        self.base = BaseDriver(
+            yaw_source=self._yaw_source,
+            watchdog_timeout=self._watchdog_timeout,
+        )
         self.sensors = SensorHub()
         # 注入 executor 驱动的 future 等待回调：三个子节点都已加入本节点的
         # executor，若 ArmController 内部直接 spin_until_future_complete(self)
@@ -128,6 +130,8 @@ class MissionManager(Node):
             opening_min_range=self._opening_range,
             advance_timeout=self._advance_timeout,
             angular_scale_correction=self._ang_scale,
+            scan_timeout=self._scan_timeout,
+            vision_timeout=self._vision_timeout,
         )
         self.grasp = GraspFSM(self, self.arm)
 
@@ -164,6 +168,14 @@ class MissionManager(Node):
         self.declare_parameter('yaw_tolerance', 0.0873)
         self.declare_parameter('advance_timeout', 12.0)
         self.declare_parameter('odom_angular_scale_correction', 1.0)
+        #: 速度看门狗阈值（秒）：看门狗独立线程超时未收到新指令即强制归零。0=禁用
+        self.declare_parameter('cmd_watchdog_timeout', 0.5)
+        #: 激光保鲜阈值（秒）：失效即禁止移动（否则激光失效会被误判为"前方通畅"）
+        self.declare_parameter('scan_timeout', 0.5)
+        #: 相机保鲜阈值（秒）：失效即禁止前进（否则循迹偏差恒 0，闷头直行）
+        self.declare_parameter('vision_timeout', 2.0)
+        #: 传感器失效后的等待上限（秒）：先给一次恢复机会，仍失效才判 FAULT
+        self.declare_parameter('sensor_wait_timeout', 3.0)
         #: 航向来源：'odom_raw'（默认，与位置同源、高频）或 'odom'
         #: （EKF 输出，融合 IMU 航向通常更准，但仅约 6Hz）
         self.declare_parameter('yaw_source', 'odom_raw')
@@ -205,6 +217,10 @@ class MissionManager(Node):
         self._yaw_tolerance = float(p('yaw_tolerance').value)
         self._advance_timeout = float(p('advance_timeout').value)
         self._ang_scale = float(p('odom_angular_scale_correction').value)
+        self._watchdog_timeout = float(p('cmd_watchdog_timeout').value)
+        self._scan_timeout = float(p('scan_timeout').value)
+        self._vision_timeout = float(p('vision_timeout').value)
+        self._sensor_wait_timeout = float(p('sensor_wait_timeout').value)
         self._yaw_source = str(p('yaw_source').value)
         self._opening_range = float(p('opening_min_range').value)
         self._safety_range = float(p('safety_range').value)
@@ -296,6 +312,15 @@ class MissionManager(Node):
     def _run_explore(self) -> MissionState:
         cur = self.mapper.robot_rc
         heading = self.mapper.robot_heading
+
+        # 0) 激光失效时禁止勘测路口：扇区取距失效会被读成"四处开口"，
+        #    拓扑会被写脏，进而规划出撞墙路径。先给一次恢复机会，仍失效则 FAULT。
+        if not self._wait_for_fresh_scan():
+            self.get_logger().error(
+                f'激光数据失效（年龄 {self.motion.scan_age():.1f}s > '
+                f'{self._scan_timeout:.1f}s），拓扑不可信，任务中止'
+            )
+            return MissionState.FAULT
 
         # 1) 路口扫描并写入拓扑
         front, left, right = self.motion.scan_openings()
@@ -445,6 +470,27 @@ class MissionManager(Node):
             return MissionState.FAULT
         return MissionState.EXPLORE
 
+    def _wait_for_fresh_scan(self) -> bool:
+        """等待激光恢复新鲜；返回是否可用。
+
+        抖动容忍：传感器偶发掉一两帧属正常，先自旋等待 ``sensor_wait_timeout``
+        秒；期间持续 spin 让回调有机会更新数据。
+        """
+        if self.motion.scan_age() <= self._scan_timeout:
+            return True
+        self.get_logger().warn(
+            f'激光数据不新鲜（年龄 {self.motion.scan_age():.2f}s），'
+            f'等待最多 {self._sensor_wait_timeout:.1f}s 恢复'
+        )
+        deadline = time.monotonic() + self._sensor_wait_timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._spin(0.1)
+            if self.motion.scan_age() <= self._scan_timeout:
+                self.get_logger().info('激光已恢复')
+                return True
+        self.base.stop()
+        return False
+
     def _nearest_block(self, color: Optional[str] = None) -> Optional[BlockDetection]:
         """返回视野内最近的可收集方块。
 
@@ -479,7 +525,7 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         node.get_logger().info('人工中断')
     finally:
-        node.base.stop()
+        node.base.shutdown()  # 停看门狗 + 确保下发停止
         node._spin(0.1)  # noqa: SLF001 - 退出前确保下发停止
         for child in (node.arm, node.sensors, node.base, node):
             child.destroy_node()
