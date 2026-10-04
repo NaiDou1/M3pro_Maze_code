@@ -69,6 +69,8 @@ class LineDetector:
         self._row_samples = max(2, int(row_samples))
         self._lost = 0
         self._last = LineObservation(valid=False)
+        #: 最近一次的 ROI 二值化掩膜，供调试节点可视化（调 HSV 阈值时最有用）
+        self._last_mask = None
 
     def detect(self, bgr: np.ndarray) -> LineObservation:
         """对一帧 BGR 图像做检测。"""
@@ -82,6 +84,7 @@ class LineDetector:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self._lower, self._upper)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
+        self._last_mask = mask
 
         if cv2.countNonZero(mask) < self._min_pixels:
             return self._mark_lost()
@@ -136,6 +139,14 @@ class LineDetector:
     def last(self) -> LineObservation:
         """返回最近一次检测结果（不重新计算）。"""
         return self._last
+
+    def last_mask(self) -> Optional[np.ndarray]:
+        """返回最近一次 ROI 的二值化掩膜；尚未检测过时为 ``None``。
+
+        用途：调 HSV 阈值时直接看掩膜——黑线应该是一条连贯的白色带；
+        若掩膜空白说明阈值没框住黑线，若满是噪点说明阈值太宽。
+        """
+        return self._last_mask
 
 
 class LineDetectorNode(Node):
@@ -198,6 +209,7 @@ class LineDetectorNode(Node):
     def _visualize(self, img: np.ndarray, obs: LineObservation) -> None:
         canvas = img.copy()
         h, w = canvas.shape[:2]
+        self._draw_mask(canvas, w)
         cv2.line(canvas, (w // 2, 0), (w // 2, h), (255, 0, 0), 1)
         if obs.valid:
             cv2.circle(canvas, (int(obs.center_x), int(h * 0.95)), 6, (0, 255, 0), -1)
@@ -212,6 +224,17 @@ class LineDetectorNode(Node):
             )
         cv2.imshow('line_detector', canvas)
         cv2.waitKey(1)
+
+    def _draw_mask(self, canvas: np.ndarray, width: int) -> None:
+        """把二值化掩膜缩略图贴到右上角，便于边看边调 HSV。"""
+        mask = self._det.last_mask()
+        if mask is None:
+            return
+        inset_w = max(80, width // 4)
+        scale = inset_w / float(mask.shape[1])
+        inset_h = max(1, int(mask.shape[0] * scale))
+        small = cv2.resize(mask, (inset_w, inset_h), interpolation=cv2.INTER_NEAREST)
+        canvas[0:inset_h, width - inset_w:width] = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
 
     def _report(self) -> None:
         rate = (self._valid / self._frames * 100.0) if self._frames else 0.0
