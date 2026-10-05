@@ -91,7 +91,9 @@ class MotionController:
         cruise_linear: float = 0.15,
         max_angular_z: float = 0.60,
         turn_angular: float = 0.50,
-        line_pid: Tuple[float, float, float] = (50.0, 0.0, 10.0),
+        #: 巡线 PID，误差为**归一化**偏差（1.0 = 线在图像边缘）。
+        #: ⚠️ 不要用像素量纲的增益（如 50/0/10），那会让输出恒饱和。
+        line_pid: Tuple[float, float, float] = (1.2, 0.0, 0.2),
         cell_tolerance: float = 0.03,
         yaw_tolerance: float = 0.0873,
         safety_range: float = 0.25,
@@ -103,6 +105,10 @@ class MotionController:
         scan_timeout: float = 0.5,
         #: 相机保鲜阈值（秒）：超过即视为失效，禁止前进（循迹依赖它）
         vision_timeout: float = 2.0,
+        #: 巡线转向符号：+1 = 图像右侧偏差对应左转（相机装反/图像旋转 180° 时用）；
+        #: -1 = 图像右侧偏差对应右转（本机实测：黑线近粗远细 ⇒ 图像未旋转，取 -1）。
+        #: 判据见 AGENTS §5：符号错了车会朝偏离黑线的方向一直转，然后丢线停车。
+        line_steer_sign: float = -1.0,
         #: 失效后先自旋等待恢复的时长（秒），仍失效才中止动作。
         #: 必要性：SensorHub 首帧同步 RGB-D 实测 1.38~1.88s（DDS 发现 + 配对），
         #: 且机械臂动作期间 time.sleep 不 spin 会让数据"变陈旧"——没有这段宽限，
@@ -129,6 +135,7 @@ class MotionController:
         self._scan_timeout = float(scan_timeout)
         self._vision_timeout = float(vision_timeout)
         self._recover_wait = float(sensor_recover_wait)
+        self._steer_sign = 1.0 if float(line_steer_sign) >= 0 else -1.0
         #: odom 转角缩放系数：真实转角 = 系数 × odom 读数。
         #: 需用 calibration_tool 的 motion 模式实测得出，1.0 表示不做修正。
         #: 注意方向：闭环目标是「目标转角 / 系数」，见 turn_to_heading。
@@ -142,6 +149,10 @@ class MotionController:
 
         self._pid = PID(
             kp=line_pid[0], ki=line_pid[1], kd=line_pid[2], out_limit=self._max_wz
+        )
+        self._node.get_logger().info(
+            f'巡线控制：PID={list(line_pid)}（误差为归一化偏差，1.0=线在图像边缘）'
+            f' 转向符号={self._steer_sign:+.0f}'
         )
 
     # ------------------------------------------------------------ 传感器辅助
@@ -317,7 +328,12 @@ class MotionController:
                 if img is not None:
                     obs = self._line.detect(img)
                     if obs.valid:
-                        steering = self._pid.compute(obs.offset_px, dt)
+                        # 误差用**归一化**偏差（无量纲，1.0 = 线在图像边缘），
+                        # 不要用像素值：像素值配 Kp=50 会让 |offset|>0.012px 全部
+                        # 饱和到 ±0.6rad/s，等于"满舵开关"，车只会画龙。
+                        # 乘 steer_sign：正偏差 = 线在图像右侧，而本机图像未旋转
+                        # （实测黑线近粗远细），故应右转（angular.z 为负）→ 取 -1。
+                        steering = self._steer_sign * self._pid.compute(obs.offset_norm, dt)
                     elif self._line.is_lost:
                         # 丢线保护：停止推进，交由上层处理（重定位或退格）
                         self._base.stop()

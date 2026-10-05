@@ -133,6 +133,7 @@ class MissionManager(Node):
             scan_timeout=self._scan_timeout,
             vision_timeout=self._vision_timeout,
             sensor_recover_wait=self._recover_wait,
+            line_steer_sign=self._steer_sign,
         )
         self.grasp = GraspFSM(self, self.arm)
 
@@ -164,13 +165,17 @@ class MissionManager(Node):
         self.declare_parameter('cruise_linear', 0.15)
         self.declare_parameter('max_angular_z', 0.60)
         self.declare_parameter('turn_angular', 0.50)
-        self.declare_parameter('line_pid', [50.0, 0.0, 10.0])
+        #: 巡线 PID：误差是**归一化**偏差（1.0 = 线在图像边缘），不是像素值。
+        #: 旧默认 [50,0,10] 是像素量纲，会让输出恒饱和（bang-bang），故一并改掉。
+        self.declare_parameter('line_pid', [1.2, 0.0, 0.2])
         self.declare_parameter('cell_advance_tolerance', 0.03)
         self.declare_parameter('yaw_tolerance', 0.0873)
         self.declare_parameter('advance_timeout', 12.0)
         self.declare_parameter('odom_angular_scale_correction', 1.0)
         #: 速度看门狗阈值（秒）：看门狗独立线程超时未收到新指令即强制归零。0=禁用
         self.declare_parameter('cmd_watchdog_timeout', 0.5)
+        #: 巡线转向符号：-1 = 图像右侧偏差对应右转（本机实测），+1 = 相机装反时
+        self.declare_parameter('line_steer_sign', -1.0)
         #: 激光保鲜阈值（秒）：失效即禁止移动（否则激光失效会被误判为"前方通畅"）
         self.declare_parameter('scan_timeout', 0.5)
         #: 相机保鲜阈值（秒）：失效即禁止前进（否则循迹偏差恒 0，闷头直行）
@@ -220,6 +225,7 @@ class MissionManager(Node):
         self._max_wz = float(p('max_angular_z').value)
         self._turn_wz = float(p('turn_angular').value)
         self._line_pid = tuple(float(v) for v in p('line_pid').value)
+        self._steer_sign = float(p('line_steer_sign').value)
         self._cell_tolerance = float(p('cell_advance_tolerance').value)
         self._yaw_tolerance = float(p('yaw_tolerance').value)
         self._advance_timeout = float(p('advance_timeout').value)

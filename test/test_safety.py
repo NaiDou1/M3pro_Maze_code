@@ -14,9 +14,12 @@ import math
 import time
 from typing import List, Tuple
 
+import numpy as np
+
 import pytest
 
 from maze_explorer.base_driver import CommandWatchdog
+from maze_explorer.line_detector import LineObservation
 from maze_explorer.motion_controller import MotionController
 
 
@@ -397,3 +400,100 @@ def test_wait_until_healthy_returns_true_when_already_fresh() -> None:
     started = time.monotonic()
     assert controller.wait_until_healthy(need_vision=True, timeout=5.0) is True
     assert time.monotonic() - started < 0.1
+
+
+# ------------------------------------ 五、巡线转向符号（2026-10-05 实测回归）
+
+class FakeLine:
+    """固定偏差的巡线桩：``offset_norm > 0`` 表示线在图像右侧。"""
+
+    def __init__(self, offset_px: float, width: float = 640.0) -> None:
+        self._obs = LineObservation(
+            valid=True, offset_px=offset_px, offset_norm=offset_px / (width / 2.0)
+        )
+        self.is_lost = False
+
+    def detect(self, _img):
+        return self._obs
+
+
+class DriveSensors(FakeSensors):
+    """advance() 需要的完整传感器桩：新鲜、有图、前方无遮挡。"""
+
+    def get_rgbd(self):
+        return (np.zeros((4, 4, 3), dtype=np.uint8), np.zeros((4, 4), dtype=np.float32))
+
+    def sector_min_range(self, _angle_deg, _half_width_deg):
+        return 2.0          # 远高于 safety_range，不触发碰撞保护
+
+
+def _drive_once(controller: MotionController, base: FakeBase, timeout: float = 0.2):
+    """让 advance() 跑一小段（靠超时退出），返回期间下发的 angular.z 序列。"""
+    base.commands.clear()
+    controller.advance(0.1, timeout=timeout)
+    return [c[2] for c in base.commands]
+
+
+def test_steering_turns_toward_line_on_right(ros_context) -> None:  # noqa: ARG001
+    """线在图像右侧（offset_norm>0）必须右转 = angular.z 为负。
+
+    实测背景（2026-10-05）：黑线在图像里近粗远细（行 280 宽 12px → 行 460 宽 17px）
+    ⇒ 图像下半部为近处、未旋转 ⇒ 图像右侧 = 车体右侧；旧代码给 +Kp·offset_px（左转），
+    车越转越偏、随后丢线，现场表现为"一直往左转、不跟随"。
+    """
+    base = FakeBase()
+    controller, _ = _make_controller(
+        base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
+    )
+    controller._line = FakeLine(offset_px=+40.0)  # noqa: SLF001
+
+    zs = _drive_once(controller, base)
+
+    assert zs, '未下发任何速度指令'
+    assert all(z <= 0.0 for z in zs), f'线在右侧却给了左转指令：{zs}'
+    assert any(z < 0.0 for z in zs), '转向量恒为 0，符号检查失效'
+
+
+def test_steering_turns_left_when_line_on_left(ros_context) -> None:  # noqa: ARG001
+    """线在左侧（offset_norm<0）必须左转 = angular.z 为正。"""
+    base = FakeBase()
+    controller, _ = _make_controller(
+        base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
+    )
+    controller._line = FakeLine(offset_px=-40.0)  # noqa: SLF001
+
+    zs = _drive_once(controller, base)
+
+    assert any(z > 0.0 for z in zs), f'线在左侧却给了右转指令：{zs}'
+
+
+def test_steering_sign_is_configurable(ros_context) -> None:  # noqa: ARG001
+    """line_steer_sign=+1 时符号翻转（供相机装反的场合使用）。"""
+    base = FakeBase()
+    controller, _ = _make_controller(
+        base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
+    )
+    controller._line = FakeLine(offset_px=+40.0)  # noqa: SLF001
+    controller._steer_sign = +1.0  # noqa: SLF001
+
+    zs = _drive_once(controller, base)
+
+    assert any(z > 0.0 for z in zs), '符号开关未生效'
+
+
+def test_steering_not_saturated_by_small_offset(ros_context) -> None:  # noqa: ARG001
+    """归一化误差 + 合理增益 ⇒ 小偏差给出小转向，不再"满舵"。
+
+    旧实现 Kp=50 配像素误差：40px 偏差直接被限幅到 ±0.6rad/s（满舵开关）。
+    """
+    base = FakeBase()
+    controller, _ = _make_controller(
+        base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
+    )
+    controller._line = FakeLine(offset_px=+20.0)  # offset_norm=0.0625  # noqa: SLF001
+
+    zs = [z for z in _drive_once(controller, base) if z != 0.0]
+
+    assert zs, '未产生转向'
+    assert all(abs(z) < 0.6 for z in zs), f'小偏差被饱和成满舵：{zs[:5]}…'
+    assert abs(zs[0]) < 0.2, f'归一化偏差 0.0625 转向过大：{zs[0]:.3f}'
