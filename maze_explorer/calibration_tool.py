@@ -39,7 +39,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan
 
 from maze_explorer.base_driver import yaw_from_quaternion
 
@@ -66,12 +66,29 @@ class CalibrationTool(Node):
         self.declare_parameter('arm_topic', 'arm6_joints')
         #: 配置文件所在目录（默认取本包 install 前的 src 目录）
         self.declare_parameter('config_dir', '')
+        # ---------------- 纯巡线测试（mode=follow）所需，与任务同一套语义 ----------------
+        #: 以下键名与 config/*.yaml 一致；calib_entry 会把两份 yaml 一起传进来，
+        #: 因此这里读到的是**已标定**的值，而不是工具自己的默认值。
+        self.declare_parameter('line_hsv', [0, 0, 0, 180, 255, 80])
+        self.declare_parameter('line_roi_top_ratio', 0.5)
+        self.declare_parameter('min_line_pixels', 200)
+        self.declare_parameter('morph_kernel', 5)
+        self.declare_parameter('line_lost_frames', 5)
+        self.declare_parameter('line_pid', [1.2, 0.0, 0.2])
+        self.declare_parameter('line_steer_sign', -1.0)
+        self.declare_parameter('cruise_linear', 0.12)
+        self.declare_parameter('max_angular_z', 0.60)
+        self.declare_parameter('safety_range', 0.25)
+        self.declare_parameter('cell_size', 0.40)
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('vision_timeout', 2.0)
 
         self.mode = str(self.get_parameter('mode').value)
         self._config_dir = self._resolve_config_dir()
 
         self._lock = threading.Lock()
         self._image: Optional[np.ndarray] = None
+        self._image_ts = 0.0
         self._pose: Optional[Tuple[float, float, float]] = None
         self._last_odom_ts = 0.0
 
@@ -87,6 +104,11 @@ class CalibrationTool(Node):
         )
         self.create_subscription(
             Odometry, str(self.get_parameter('odom_topic').value), self._on_odom, 50
+        )
+        # 巡线测试用：激光只做碰撞守卫，不做拓扑（无挡板也能跑）
+        self._scan: Optional[LaserScan] = None
+        self.create_subscription(
+            LaserScan, str(self.get_parameter('scan_topic').value), self._on_scan, 10
         )
 
         # HSV 标定状态
@@ -152,6 +174,21 @@ class CalibrationTool(Node):
             return
         with self._lock:
             self._image = img
+            self._image_ts = time.monotonic()
+
+    def _on_scan(self, msg: LaserScan) -> None:
+        self._scan = msg
+
+    def _front_range(self) -> Optional[float]:
+        """前方扇区（0°±20°）最近有效距离（米）；无有效点返回 None。"""
+        scan = self._scan
+        if scan is None or not scan.ranges:
+            return None
+        r = np.asarray(scan.ranges, dtype=np.float32)
+        ang = scan.angle_min + np.arange(r.size, dtype=np.float32) * scan.angle_increment
+        sel = r[np.abs(np.arctan2(np.sin(ang), np.cos(ang))) <= math.radians(20.0)]
+        sel = sel[np.isfinite(sel) & (sel >= 0.05) & (sel <= 4.0)]
+        return float(sel.min()) if sel.size else None
 
     def _on_odom(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
@@ -338,6 +375,105 @@ class CalibrationTool(Node):
         msg.time = time_ms
         self._pub_arm.publish(msg)
 
+    # -------------------------------------------------- 模式四：纯巡线测试
+
+    def run_follow(self, cells: float = 5.0) -> None:
+        """纯巡线测试：只靠相机沿黑线走，**不依赖挡板与激光拓扑**。
+
+        用途：现场还没搭挡板时验证巡线（`--run` 会依赖激光测墙判开口，无挡板必失败）。
+        与任务里 ``MotionController.advance`` 使用同一套语义——归一化偏差、同一个
+        `line_steer_sign`、同样的丢线保护——所以这里能走通，任务里的巡线就走得通。
+
+        :param cells: 走多少个格距（默认 5 格 = 2.0m），走满即停。
+        """
+        from maze_explorer.line_detector import LineDetector
+        from maze_explorer.motion_controller import PID
+
+        hsv = [int(v) for v in self.get_parameter('line_hsv').value]
+        det = LineDetector(
+            hsv_range=(hsv[:3], hsv[3:]),
+            roi_top_ratio=float(self.get_parameter('line_roi_top_ratio').value),
+            min_pixels=int(self.get_parameter('min_line_pixels').value),
+            morph_kernel=int(self.get_parameter('morph_kernel').value),
+            lost_frames=int(self.get_parameter('line_lost_frames').value),
+        )
+        kp, ki, kd = (float(v) for v in self.get_parameter('line_pid').value)
+        max_wz = float(self.get_parameter('max_angular_z').value)
+        pid = PID(kp=kp, ki=ki, kd=kd, out_limit=max_wz)
+        sign = 1.0 if float(self.get_parameter('line_steer_sign').value) >= 0 else -1.0
+        speed = float(self.get_parameter('cruise_linear').value)
+        safety = float(self.get_parameter('safety_range').value)
+        vision_timeout = float(self.get_parameter('vision_timeout').value)
+        target = cells * float(self.get_parameter('cell_size').value)
+
+        # 刚启动时订阅还没收到数据，先等里程计与首帧图像（实测不等待会立刻退出）
+        deadline = time.monotonic() + 10.0
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self._current_pose() is not None and self._snapshot() is not None:
+                break
+        start = self._current_pose()
+        if start is None:
+            self.get_logger().warn('10s 内未收到里程计，无法巡线测试')
+            return
+        self.get_logger().info(
+            f'巡线测试开始：目标 {target:.2f}m（{cells:.0f} 格），速度 {speed:.2f}m/s，'
+            f'PID=({kp},{ki},{kd})，转向符号 {sign:+.0f}；Ctrl-C 随时停'
+        )
+
+        last_t = time.monotonic()
+        last_log = last_t
+        traveled = 0.0
+        reason = '走满目标距离'
+        while rclpy.ok():
+            now = time.monotonic()
+            dt = now - last_t
+            last_t = now
+
+            front = self._front_range()
+            if front is not None and front < safety:
+                reason = f'前方 {front:.2f}m 触发碰撞保护'
+                break
+
+            with self._lock:
+                img_age = now - self._image_ts if self._image_ts else float('inf')
+            img = self._snapshot()
+            if img is None or img_age > vision_timeout:
+                reason = f'相机数据失效（年龄 {img_age:.1f}s）'
+                break
+
+            obs = det.detect(img)
+            if obs.valid:
+                steering = sign * pid.compute(obs.offset_norm, dt)
+            elif det.is_lost:
+                reason = f'连续丢线 {obs.lost_frames} 帧'
+                break
+            else:
+                steering = 0.0
+            self._publish_vel(speed, 0.0, steering)
+
+            cur = self._current_pose()
+            if cur is not None:
+                traveled = math.hypot(cur[0] - start[0], cur[1] - start[1])
+                if traveled >= target:
+                    break
+            if now - last_log >= 1.0:
+                last_log = now
+                flag = '' if obs.valid else f'（本次无效，丢线 {obs.lost_frames}）'
+                self.get_logger().info(
+                    f'  {traveled:5.2f}m 偏差 {obs.offset_norm:+.3f}'
+                    f'（{obs.offset_px:+.0f}px）→ 转向 {steering:+.3f} rad/s{flag}'
+                )
+            rclpy.spin_once(self, timeout_sec=0.02)
+
+        self._publish_vel(0.0, 0.0, 0.0)
+        self.get_logger().info(f'巡线测试结束：{reason}，共走 {traveled:.2f}m')
+        if reason.startswith('连续丢线'):
+            self.get_logger().warn(
+                '丢线排查：① 车是否压在黑线上、线是否在画面里（可用 line_detector 看掩膜）'
+                ' ② line_hsv 是否框住黑线 ③ 若线在画面里却检不到，看掩膜缩略图'
+            )
+
     # -------------------------------------------------- 模式三：运动标定自测
 
     def run_motion(self) -> None:
@@ -463,8 +599,12 @@ def main(args=None) -> None:
             node.run_line_pose()
         elif node.mode == 'motion':
             node.run_motion()
+        elif node.mode == 'follow':
+            node.run_follow()
         else:
-            node.get_logger().error(f'未知 mode={node.mode}，可选 hsv / line_pose / motion')
+            node.get_logger().error(
+                f'未知 mode={node.mode}，可选 hsv / line_pose / motion / follow'
+            )
     except KeyboardInterrupt:
         pass
     finally:

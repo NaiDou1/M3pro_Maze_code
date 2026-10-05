@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 #: 菜单编号 -> (模式名, 说明)
@@ -32,10 +33,14 @@ CALIB_MENU: Dict[str, Tuple[str, str]] = {
     '1': ('hsv', '黑线与四色 HSV 阈值（最先做）'),
     '2': ('line_pose', '机械臂巡线姿态'),
     '3': ('motion', '走格距离与 90 度转角系数'),
+    '4': ('follow', '纯巡线测试（不需要挡板，验证能否跟线）'),
 }
 
 #: 合法的模式名
-MODES: Tuple[str, ...] = ('hsv', 'line_pose', 'motion')
+MODES: Tuple[str, ...] = ('hsv', 'line_pose', 'motion', 'follow')
+
+#: 需要图形界面的模式（cv2.imshow）；motion / follow 不需要
+GUI_MODES: Tuple[str, ...] = ('hsv', 'line_pose')
 
 #: 各模式标定完成后的下一步建议
 NEXT_STEPS: Dict[str, str] = {
@@ -51,6 +56,10 @@ NEXT_STEPS: Dict[str, str] = {
         '请把上面打印的建议系数填进 config/maze_params.yaml 的\n'
         '    odom_linear_scale_correction 与 odom_angular_scale_correction，\n'
         '    然后运行 maze_run --check-only 确认硬件就绪后再正式开跑'
+    ),
+    'follow': (
+        '巡线测试用于**没有挡板**时验证跟线：它只靠相机，不做激光拓扑。\n'
+        '    注意正式任务 maze_run 依赖激光测墙判开口，没有挡板会乱转向'
     ),
 }
 
@@ -100,6 +109,17 @@ def suggest_next(mode: str) -> str:
     return NEXT_STEPS.get(mode, '')
 
 
+def _share_config(filename: str) -> Optional[Path]:
+    """返回 install/share 下的配置文件路径；找不到返回 ``None``。"""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+
+        path = Path(get_package_share_directory('maze_explorer')) / 'config' / filename
+        return path if path.is_file() else None
+    except Exception:  # noqa: BLE001 - 未安装时退化为工具自身默认值
+        return None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args: List[str] = list(sys.argv[1:] if argv is None else argv)
 
@@ -111,8 +131,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 复用 calibration_tool 的实现，仅以参数形式指定模式
     from maze_explorer.calibration_tool import main as calibration_main
 
+    # 把两份 yaml 一并传入：标定工具自己声明的默认值与 yaml 可能不一致，
+    # 尤其 follow 模式必须用**已标定**的 line_hsv / line_pid / line_steer_sign。
+    argv_tool = ['--ros-args', '-p', f'mode:={mode}']
+    for name in ('maze_params.yaml', 'hsv_params.yaml'):
+        path = _share_config(name)
+        if path is not None:
+            argv_tool += ['--params-file', str(path)]
+
+    if mode in GUI_MODES:
+        print('[maze_calib] 该模式需要图形界面（cv2 窗口），请确认在桌面终端运行')
     print(f'[maze_calib] 进入标定模式：{mode}（Ctrl-C 可随时退出）')
-    calibration_main(['--ros-args', '-p', f'mode:={mode}'])
+    calibration_main(argv_tool)
 
     print()
     print('=' * 64)
