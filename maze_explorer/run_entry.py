@@ -16,8 +16,8 @@
 用法::
 
     ros2 run maze_explorer maze_run                 # 自检通过后开始探索
-    ros2 run maze_explorer maze_run --check-only    # 只自检不启动（首次使用推荐）
-    ros2 run maze_explorer maze_run origin_rc:="[0,0]" exit_rc:="[6,6]"
+    ros2 run maze_explorer maze_run --check-only    # 只自检不启动，首次使用推荐
+    ros2 run maze_explorer maze_run origin_rc:=<入口 rc 数组> exit_rc:=<出口 rc 数组>
 
 .. note::
    ``ROS_DOMAIN_ID=30`` 必须与其余节点一致，否则自检会全项失败——自检提示中
@@ -39,9 +39,13 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
 
-#: 单项自检的等待上限（秒）
+#: 单项自检的等待上限，单位 s
 DEFAULT_TIMEOUT = 4.0
-#: 手柄自启链路涉及的可执行/进程名，需整条链路一起关闭
+#: 自检轮询期间每次自旋的时长，单位 s
+PROBE_SPIN_SEC = 0.1
+#: 杀掉手柄链路后的静置时长，单位 s，等进程真正退出
+JOY_KILL_SETTLE_SEC = 1.0
+#: 手柄自启链路涉及的可执行与进程名，需整条链路一起关闭
 _JOY_PATTERNS = (
     'start_joy_controller.py',
     'yahboomcar_joy_launch.py',
@@ -71,20 +75,37 @@ class _Probe(Node):
         self.ik_client = self.create_client(ArmKinemarics, 'get_kinemarics')
 
     def _on_odom(self, _msg: Odometry) -> None:
+        """收到首帧里程计即记为就绪，消息体本身不使用。
+
+        :param _msg: 里程计消息，来自 ``/odom_raw``。
+        """
         self.seen['odom'] = True
 
     def _on_scan(self, _msg: LaserScan) -> None:
+        """收到首帧激光即记为就绪，消息体本身不使用。
+
+        :param _msg: 激光消息，来自 ``/scan``。
+        """
         self.seen['scan'] = True
 
     def _on_image(self, _msg: Image) -> None:
+        """收到首帧彩色图即记为就绪，消息体本身不使用。
+
+        :param _msg: 彩色图消息，来自 ``/camera/color/image_raw``。
+        """
         self.seen['camera'] = True
 
 
 def run_self_check(probe: _Probe, timeout: float = DEFAULT_TIMEOUT) -> List[HardwareCheck]:
-    """逐项检查硬件依赖，返回全部结果（不抛异常）。"""
+    """逐项检查硬件依赖，返回全部结果，不抛异常。
+
+    :param probe: 已创建的自检探针节点。
+    :param timeout: 单项自检的等待上限，单位 s。
+    :returns: 里程计、激光、相机与 IK 服务四项的结果列表。
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and not all(probe.seen.values()):
-        rclpy.spin_once(probe, timeout_sec=0.1)
+        rclpy.spin_once(probe, timeout_sec=PROBE_SPIN_SEC)
 
     domain_id = os.environ.get('ROS_DOMAIN_ID', '<未设置>')
     domain_hint = f'（当前 ROS_DOMAIN_ID={domain_id}，须为 30）'
@@ -152,11 +173,11 @@ def kill_joy_autostart() -> None:
                 ['pgrep', '-f', pattern], capture_output=True, check=False
             )
         except FileNotFoundError:
-            return  # 系统无 pgrep/pkill，跳过（不阻塞启动）
+            return  # 系统无 pgrep 与 pkill 时跳过，不阻塞启动
         if found.returncode == 0:
             print(f'[maze_run] 关闭手柄自启进程：{pattern}')
             subprocess.run(['pkill', '-f', pattern], check=False)
-    time.sleep(1.0)
+    time.sleep(JOY_KILL_SETTLE_SEC)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
