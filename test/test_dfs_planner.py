@@ -8,6 +8,7 @@ from maze_explorer.grid_mapper import GridMapper
 
 @pytest.fixture()
 def setup():
+    """提供 7x7 迷宫与退出格在入口的规划器，各测试独占一套。"""
     mapper = GridMapper(grid_size=7, cell_size=0.40)
     planner = DfsPlanner(mapper, exit_rc=(0, 0))
     return mapper, planner
@@ -16,14 +17,16 @@ def setup():
 # ------------------------------------------------------------------ 决策
 
 def test_finish_when_no_opening_known(setup):
+    """无任何开口已知时直接判定探索完成，避免原地空转。"""
     _, planner = setup
     decision = planner.decide()
     assert decision.kind == 'finish'
 
 
 def test_advance_into_unvisited_opening(setup):
+    """前方有未访问开口即优先前进，并给出目标格与方向。"""
     mapper, planner = setup
-    # 入口 (0,0) 朝东，前方与左方开口（左方越界会被忽略）
+    # 入口 0 行 0 列朝东，前方与左方开口，左方越界会被忽略
     mapper.observe((0, 0), 'E', front_open=True, left_open=True, right_open=False)
 
     decision = planner.decide()
@@ -33,6 +36,7 @@ def test_advance_into_unvisited_opening(setup):
 
 
 def test_prefers_current_heading_to_avoid_turn(setup):
+    """多方向可走时保持当前朝向，省掉一次原地转向。"""
     mapper, planner = setup
     mapper.observe((3, 3), 'E', front_open=True, left_open=True, right_open=False)
     mapper.robot_rc = (3, 3)
@@ -44,6 +48,7 @@ def test_prefers_current_heading_to_avoid_turn(setup):
 
 
 def test_commit_advance_pushes_path(setup):
+    """提交前进决策后须把目标格压入路径栈。"""
     mapper, planner = setup
     mapper.observe((0, 0), 'E', front_open=True, left_open=False, right_open=False)
     decision = planner.decide()
@@ -53,8 +58,9 @@ def test_commit_advance_pushes_path(setup):
 
 
 def test_backtrack_when_branch_exhausted(setup):
+    """分支走尽即回溯到来路格，并把路径栈弹回。"""
     mapper, planner = setup
-    # 走到 (0,1)，它没有其他开口
+    # 已走到 0 行 1 列，它没有其他开口
     mapper.cell(0, 0).open = {'E'}
     mapper.cell(0, 1).open = {'W'}
     mapper.cell(0, 1).visited = True
@@ -71,6 +77,7 @@ def test_backtrack_when_branch_exhausted(setup):
 
 
 def test_finish_at_root_when_everything_explored(setup):
+    """回到根格且全部探索完毕才判定 finish。"""
     mapper, planner = setup
     mapper.cell(0, 0).open = {'E'}
     mapper.cell(0, 1).visited = True
@@ -83,6 +90,7 @@ def test_finish_at_root_when_everything_explored(setup):
 # -------------------------------------------------------------- 目标调度
 
 def test_pending_targets_sorted_by_depth_desc(setup):
+    """待抓目标按深度降序出队，深层方块优先，罚时最大。"""
     mapper, planner = setup
     mapper.cell(0, 1).depth = 1
     mapper.cell(3, 3).depth = 5
@@ -97,6 +105,7 @@ def test_pending_targets_sorted_by_depth_desc(setup):
 
 
 def test_mark_done_removes_from_pending(setup):
+    """完成的目标移出待办并计入完成计数。"""
     _, planner = setup
     target = planner.register_target('red', (0, 1))
 
@@ -106,6 +115,7 @@ def test_mark_done_removes_from_pending(setup):
 
 
 def test_failed_target_stays_pending_for_retry(setup):
+    """失败的目标留在待办，后续探索中重试。"""
     _, planner = setup
     target = planner.register_target('red', (0, 1))
 
@@ -116,8 +126,9 @@ def test_failed_target_stays_pending_for_retry(setup):
 # -------------------------------------------------------------- 路径规划
 
 def test_shortest_path_bfs(setup):
+    """L 形通路的最短路径须按格序返回，含起点与终点。"""
     mapper, planner = setup
-    # 构造 L 形通路: (0,0)-(0,1)-(0,2)-(1,2)
+    # 构造 L 形通路：入口向东两格，再折向南一格
     mapper.cell(0, 0).open = {'E'}
     mapper.cell(0, 1).open = {'W', 'E'}
     mapper.cell(0, 2).open = {'W', 'S'}
@@ -128,6 +139,7 @@ def test_shortest_path_bfs(setup):
 
 
 def test_shortest_path_returns_empty_when_unreachable(setup):
+    """不可达时返回空列表，调用方据此放弃寻路。"""
     mapper, planner = setup
     mapper.cell(0, 0).open = {'E'}
 
@@ -135,11 +147,13 @@ def test_shortest_path_returns_empty_when_unreachable(setup):
 
 
 def test_path_directions(setup):
+    """路径按格序翻译为逐段方向序列。"""
     _, planner = setup
     directions = planner.path_directions([(0, 0), (0, 1), (0, 2), (1, 2)])
     assert directions == ['E', 'E', 'S']
 
 
 def test_same_cell_path_is_singleton(setup):
+    """起点与终点同格返回单元素路径，避免自环。"""
     _, planner = setup
     assert planner.shortest_path((2, 2), (2, 2)) == [(2, 2)]
