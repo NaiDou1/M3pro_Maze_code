@@ -370,6 +370,7 @@ class BlockDetectorNode(Node):
     """独立调试节点，订阅 RGB-D 并打印检测结果。"""
 
     def __init__(self) -> None:
+        """声明检测参数并装配检测器，使调试节点可脱离上层独立出数。"""
         super().__init__('block_detector')
 
         self.declare_parameter('color_topic', '/camera/color/image_raw')

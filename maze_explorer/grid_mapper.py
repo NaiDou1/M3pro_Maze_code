@@ -403,6 +403,7 @@ class GridMapperNode(Node):
     """独立调试节点，按周期打印拓扑快照，数据由上层填充。"""
 
     def __init__(self) -> None:
+        """声明网格参数并装配空拓扑，按周期打印上层填充后的快照。"""
         super().__init__('grid_mapper')
         self.declare_parameter('grid_size', 7)
         self.declare_parameter('cell_size', 0.40)

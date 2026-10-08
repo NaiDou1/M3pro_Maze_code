@@ -26,6 +26,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
+    """声明三个可覆盖参数并只启动 mission_manager，子节点由它自行创建。"""
     config_dir = os.path.join(get_package_share_directory('maze_explorer'), 'config')
 
     param_files = [

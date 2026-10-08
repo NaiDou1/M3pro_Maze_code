@@ -249,7 +249,7 @@ def test_sensor_hub_scan_age(ros_context) -> None:  # noqa: ARG001
 
 
 def test_base_driver_watchdog_wiring(ros_context) -> None:  # noqa: ARG001
-    """BaseDriver 接线：非零指令停止刷新后，看门狗强制把缓存归零。"""
+    """接线校验：BaseDriver 非零指令停止刷新后，看门狗强制把缓存归零。"""
     from maze_explorer.base_driver import BaseDriver
 
     node = BaseDriver(watchdog_timeout=0.2)

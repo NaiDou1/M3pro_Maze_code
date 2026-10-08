@@ -66,6 +66,8 @@ class FakeBase:
 
 
 class FakeLogger:
+    """空实现日志桩：被测代码打日志时不报错也不产生输出。"""
+
     def warn(self, *args, **kwargs) -> None:  # noqa: D102
         pass
 

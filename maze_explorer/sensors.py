@@ -73,6 +73,7 @@ class SensorHub(Node):
     """
 
     def __init__(self) -> None:
+        """构造期完成参数声明、RGB-D 同步订阅与带锁缓冲装配。"""
         super().__init__('sensors')
 
         self.declare_parameter('color_topic', '/camera/color/image_raw')

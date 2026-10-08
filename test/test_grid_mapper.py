@@ -54,7 +54,7 @@ def test_heading_yaw_values(mapper):
 
 @pytest.mark.parametrize('heading', ['N', 'E', 'S', 'W'])
 def test_yaw_heading_roundtrip(mapper, heading):
-    """yaw 与方向互转在四个方向上往返一致。"""
+    """四个方向下 yaw 与方向互转的结果都往返一致。"""
     assert mapper.yaw_to_heading(mapper.heading_yaw(heading)) == heading
 
 

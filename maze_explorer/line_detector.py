@@ -200,6 +200,7 @@ class LineDetectorNode(Node):
     """独立调试节点，订阅相机画面并按周期统计检测情况。"""
 
     def __init__(self) -> None:
+        """声明循线参数并装配检测器，订阅画面后按周期打印统计报告。"""
         super().__init__('line_detector')
 
         self.declare_parameter('color_topic', '/camera/color/image_raw')
