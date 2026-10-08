@@ -445,7 +445,7 @@ def test_steering_turns_toward_line_on_right(ros_context) -> None:  # noqa: ARG0
     controller, _ = _make_controller(
         base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
     )
-    controller._line = FakeLine(offset_px=+40.0)  # noqa: SLF001
+    controller._line_detector = FakeLine(offset_px=+40.0)  # noqa: SLF001
 
     zs = _drive_once(controller, base)
 
@@ -460,7 +460,7 @@ def test_steering_turns_left_when_line_on_left(ros_context) -> None:  # noqa: AR
     controller, _ = _make_controller(
         base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
     )
-    controller._line = FakeLine(offset_px=-40.0)  # noqa: SLF001
+    controller._line_detector = FakeLine(offset_px=-40.0)  # noqa: SLF001
 
     zs = _drive_once(controller, base)
 
@@ -473,8 +473,8 @@ def test_steering_sign_is_configurable(ros_context) -> None:  # noqa: ARG001
     controller, _ = _make_controller(
         base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
     )
-    controller._line = FakeLine(offset_px=+40.0)  # noqa: SLF001
-    controller._steer_sign = +1.0  # noqa: SLF001
+    controller._line_detector = FakeLine(offset_px=+40.0)  # noqa: SLF001
+    controller._line_steer_sign = +1.0  # noqa: SLF001
 
     zs = _drive_once(controller, base)
 
@@ -490,7 +490,7 @@ def test_steering_not_saturated_by_small_offset(ros_context) -> None:  # noqa: A
     controller, _ = _make_controller(
         base, DriveSensors(), recover_wait=0.2, spin_fn=lambda _t: None
     )
-    controller._line = FakeLine(offset_px=+20.0)  # offset_norm=0.0625  # noqa: SLF001
+    controller._line_detector = FakeLine(offset_px=+20.0)  # offset_norm=0.0625  # noqa: SLF001
 
     zs = [z for z in _drive_once(controller, base) if z != 0.0]
 
