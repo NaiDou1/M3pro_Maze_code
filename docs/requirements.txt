@@ -1,0 +1,2 @@
+# 文档构建依赖。安装：python3 -m pip install -r docs/requirements.txt
+sphinx>=5.0

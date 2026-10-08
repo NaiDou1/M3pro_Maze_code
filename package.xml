@@ -21,6 +21,7 @@
 
   <!-- 视觉：RGB-D 同步与编解码 -->
   <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
 
   <!-- 机械臂：消息与 IK/FK 服务（yahboomcar_ws 内已有） -->
   <depend>arm_msgs</depend>
