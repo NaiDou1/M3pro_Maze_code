@@ -1,19 +1,19 @@
 """一键启动迷宫探索与方块收集系统。
 
 .. important::
-   本 launch **只启动自研包**。以下外部依赖需按顺序先行启动（详见 AGENTS.md）::
+   本 launch **只启动自研包**。以下外部依赖需按顺序先行启动，详见 AGENTS.md::
 
        sh /home/jetson/start_agent.sh                       # 下位机 micro-ROS
        ros2 launch slam_mapping bringup.launch.py           # 雷达链 + IMU + EKF
        ros2 launch orbbec_camera dabai_dcw2.launch.py       # 深度相机
 
-   另外运行前须关闭手柄自启节点（``joy_control/joy.sh``），否则 ``JoyState``
+   另外运行前须关闭手柄自启节点即 ``joy_control/joy.sh``，否则 ``JoyState``
    会触发部分节点的零速保护而干扰运动。
 
 用法::
 
     ros2 launch maze_explorer maze_bringup.launch.py
-    ros2 launch maze_explorer maze_bringup.launch.py origin_rc:="[0,0]" exit_rc:="[6,6]"
+    ros2 launch maze_explorer maze_bringup.launch.py origin_rc:=<入口 rc 数组> exit_rc:=<出口 rc 数组>
 """
 
 import os
