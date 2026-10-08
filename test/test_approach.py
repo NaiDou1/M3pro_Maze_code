@@ -81,7 +81,7 @@ def test_approach_does_not_overshoot_envelope() -> None:
 def test_in_grasp_envelope_boundaries() -> None:
     """包络判定与 ArmController/抓取状态机使用同一区间语义。"""
     block = BlockDetection(
-        color='red', u=320.0, v=240.0, area=600.0,
+        color='red', pixel_x=320.0, pixel_y=240.0, area=600.0,
         distance_m=0.20, lateral_m=0.0, vertical_m=0.0,
     )
     assert BlockDetector.in_grasp_envelope(block, 0.13, 0.25) is True
