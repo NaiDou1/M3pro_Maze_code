@@ -1,8 +1,8 @@
 """docstring 与注释的风格强制检查。
 
-扫描包内全部 Python 文件，对三类机械可判的违规判失败：圆括号与方括号的半角及
-全角形式、四位数字加横线的日期形式、emoji 码点。
-因果性与时间性动词的规则无法机械判定，由代码评审把关。
+扫描 Python 文件的 docstring 与行注释，以及 yaml 与 shell 脚本的注释行，
+对三类机械可判的违规判失败：圆括号与方括号的半角及全角形式、四位数字加横线的
+日期形式、emoji 码点。因果性与时间性动词的规则无法机械判定，由代码评审把关。
 用法：`pytest test -q`，或在仓库根目录执行 `python3 test/test_docstring_style.py`。
 """
 
@@ -32,14 +32,26 @@ EMOJI_RANGES: Tuple[Tuple[int, int], ...] = (
 #: 仓库根目录，测试文件位于根目录下的 test 目录
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: 待扫描目录，相对仓库根目录
-SCAN_DIRS: Tuple[str, ...] = ('maze_explorer', 'test')
+#: 待扫描的 Python 源码目录，相对仓库根目录
+SCAN_DIRS: Tuple[str, ...] = ('maze_explorer', 'test', 'launch')
+
+#: 待扫描的配置与脚本目录及其文件名模式，相对仓库根目录
+CONFIG_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ('config', '*.yaml'),
+    ('scripts', '*.sh'),
+)
 
 
 def _source_files() -> Iterator[Path]:
     """按目录名与文件名升序产出待扫描的 Python 文件路径。"""
     for dirname in SCAN_DIRS:
         yield from sorted((REPO_ROOT / dirname).glob('*.py'))
+
+
+def _config_files() -> Iterator[Path]:
+    """按目录名与文件名升序产出待扫描的 yaml 与 shell 文件路径。"""
+    for dirname, pattern in CONFIG_PATTERNS:
+        yield from sorted((REPO_ROOT / dirname).glob(pattern))
 
 
 def _iter_docstring_lines(path: Path) -> Iterator[Tuple[int, str]]:
@@ -76,6 +88,26 @@ def _iter_comment_lines(path: Path) -> Iterator[Tuple[int, str]]:
             yield token.start[0], token.string
 
 
+def _iter_plain_comment_lines(path: Path) -> Iterator[Tuple[int, str]]:
+    """产出 yaml 与 shell 文件内注释的行号与文本。
+
+    整行注释，以及井号前为空白的行内注释都计入；井号前非空白时视为取值的
+    一部分，避免把引号内的井号误判为注释。
+
+    :param path: 待读取的 yaml 或 shell 文件路径。
+    :returns: 行号与该行注释文本的二元组，行号相对文件首行为 1。
+    """
+    for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        stripped = line.lstrip()
+        if stripped.startswith('#'):
+            yield number, stripped
+            continue
+        for index, char in enumerate(line):
+            if char == '#' and line[index - 1].isspace():
+                yield number, line[index:].strip()
+                break
+
+
 def _contains_emoji(text: str) -> bool:
     """判断文本是否含 emoji 或装饰符号码点。
 
@@ -99,15 +131,13 @@ def _is_directive(text: str) -> bool:
     return body.startswith('type:') or body.startswith('noqa')
 
 
-def _find_violations(path: Path) -> List[str]:
-    """扫描单个文件，返回全部违规描述行。
+def _check_entries(path: Path, entries: List[Tuple[int, str]]) -> List[str]:
+    """对一个文件的待检查文本逐行判定，返回全部违规描述行。
 
-    :param path: 待检查的 Python 文件路径。
+    :param path: 待检查的文件路径。
+    :param entries: 行号与该行文本的二元组列表。
     :returns: 每项形如 `文件名:行号:原因` 的字符串。
     """
-    docstrings = list(_iter_docstring_lines(path))
-    comments = (entry for entry in _iter_comment_lines(path) if not _is_directive(entry[1]))
-    entries = docstrings + list(comments)
     found: List[str] = []
     for line, text in entries:
         stripped = text.strip()
@@ -122,6 +152,27 @@ def _find_violations(path: Path) -> List[str]:
     return found
 
 
+def _find_violations(path: Path) -> List[str]:
+    """扫描单个 Python 文件，返回全部违规描述行。
+
+    :param path: 待检查的 Python 文件路径。
+    :returns: 每项形如 `文件名:行号:原因` 的字符串。
+    """
+    docstrings = list(_iter_docstring_lines(path))
+    comments = (entry for entry in _iter_comment_lines(path) if not _is_directive(entry[1]))
+    return _check_entries(path, docstrings + list(comments))
+
+
+def _find_config_violations(path: Path) -> List[str]:
+    """扫描单个 yaml 或 shell 文件的注释行，返回全部违规描述行。
+
+    :param path: 待检查的配置或脚本文件路径。
+    :returns: 每项形如 `文件名:行号:原因` 的字符串。
+    """
+    entries = [entry for entry in _iter_plain_comment_lines(path)]
+    return _check_entries(path, entries)
+
+
 def collect_violations() -> List[str]:
     """扫描全部受检文件，汇总违规描述行。
 
@@ -130,6 +181,8 @@ def collect_violations() -> List[str]:
     found: List[str] = []
     for path in _source_files():
         found.extend(_find_violations(path))
+    for path in _config_files():
+        found.extend(_find_config_violations(path))
     return found
 
 
