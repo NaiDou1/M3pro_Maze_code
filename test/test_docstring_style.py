@@ -43,14 +43,16 @@ def _source_files() -> Iterator[Path]:
 
 
 def _iter_docstring_lines(path: Path) -> Iterator[Tuple[int, str]]:
-    """产出文件内全部 docstring 的行号与逐行文本。
+    """产出文件内全部 docstring 的行号与逐行文本，含模块级 docstring。
 
     :param path: 待解析的 Python 文件路径。
     :returns: 行号与该行文本的二元组，行号相对文件首行为 1。
     """
     tree = ast.parse(path.read_text(encoding='utf-8'))
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
             continue
         if not node.body or not isinstance(node.body[0], ast.Expr):
             continue
