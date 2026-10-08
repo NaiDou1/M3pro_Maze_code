@@ -11,11 +11,9 @@
 
 坐标解算
 --------
-像素加深度转相机光学坐标系，z 向前、x 向右、y 向下::
-
-    camera_x = (u - center_x) * depth / focal_x
-    camera_y = (v - center_y) * depth / focal_y
-    camera_z = depth
+像素加深度转相机光学坐标系，z 向前、x 向右、y 向下。横向偏移为 u 减
+center_x，按深度与焦距之比缩放即 camera_x；纵向同理用 v 与 center_y 得
+camera_y；camera_z 即深度本身。
 
 再用安装外参 ``mount_xyz`` 与 ``mount_rpy`` 变换到 ``base_link``。
 
