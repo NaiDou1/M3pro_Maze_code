@@ -1,3 +1,5 @@
+"""maze_explorer 包安装声明：注册入口脚本并随包分发 config 与 launch。"""
+
 import os
 from glob import glob
 

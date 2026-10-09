@@ -1,4 +1,4 @@
-"""对位触发与步长的回归测试（锁定 B3 修复）。
+"""对位触发与步长的回归测试，锁定 B3 修复。
 
 B3 原实现只要视野内出现方块就转入对位，而对位最多 4 步 × 0.15m，而相机巡线
 姿态可看到 1~2m 外的方块，导致：
@@ -24,9 +24,10 @@ def test_should_not_approach_far_blocks() -> None:
 
 
 def test_should_approach_within_trigger() -> None:
+    """触发距离内与边界都应转入对位，过近也转入由后退处理。"""
     assert should_approach(0.60, 0.60) is True   # 边界含等号
     assert should_approach(0.40, 0.60) is True
-    assert should_approach(0.05, 0.60) is True   # 过近也应转入（由对位后退处理）
+    assert should_approach(0.05, 0.60) is True   # 过近也应转入，由对位后退处理
 
 
 # -------------------------------------------------------------- 步长计算
@@ -46,10 +47,12 @@ def test_should_approach_within_trigger() -> None:
 def test_approach_step_adaptive_and_limited(
     distance: float, target: float, expected: float
 ) -> None:
+    """步长按剩余距离自适应并双向限幅，参数化覆盖远近各档与边界。"""
     assert approach_step(distance, target) == pytest.approx(expected)
 
 
 def test_approach_step_custom_limit() -> None:
+    """调用方给出的自定义限幅优先于默认限幅。"""
     assert approach_step(2.0, 0.2, limit=0.05) == pytest.approx(0.05)
     assert approach_step(0.0, 0.2, limit=0.05) == pytest.approx(-0.05)
 
@@ -81,7 +84,7 @@ def test_approach_does_not_overshoot_envelope() -> None:
 def test_in_grasp_envelope_boundaries() -> None:
     """包络判定与 ArmController/抓取状态机使用同一区间语义。"""
     block = BlockDetection(
-        color='red', u=320.0, v=240.0, area=600.0,
+        color='red', pixel_x=320.0, pixel_y=240.0, area=600.0,
         distance_m=0.20, lateral_m=0.0, vertical_m=0.0,
     )
     assert BlockDetector.in_grasp_envelope(block, 0.13, 0.25) is True

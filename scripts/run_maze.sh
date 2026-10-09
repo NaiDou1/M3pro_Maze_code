@@ -3,19 +3,19 @@
 # 迷宫探索与方块收集系统 —— 一键环境准备与启动
 #
 # 负责三件事：
-#   1. 设置 ROS_DOMAIN_ID=30（本机必须，否则看不到任何话题）
+#   1. 设置 ROS_DOMAIN_ID=30，本机必须，否则看不到任何话题
 #   2. source 三个工作区
-#   3. 关闭手柄自启链路（start_joy_controller.py 等三个进程）
+#   3. 关闭手柄自启链路，即 start_joy_controller.py 等三个进程
 # 然后启动自研包。
 #
-# 前提（按顺序先手动启动，见 AGENTS.md）：
+# 前提，按顺序先手动启动，见 AGENTS.md：
 #   sh /home/jetson/start_agent.sh
 #   ros2 launch slam_mapping bringup.launch.py
 #   ros2 launch orbbec_camera dabai_dcw2.launch.py
 #
 # 用法：
 #   ./run_maze.sh
-#   ./run_maze.sh origin_rc:="[0,0]" exit_rc:="[6,6]"
+#   ./run_maze.sh origin_rc:=<入口 rc 数组> exit_rc:=<出口 rc 数组>
 
 set -euo pipefail
 

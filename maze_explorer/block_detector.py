@@ -1,36 +1,32 @@
 """四色方块检测与三维定位。
 
-从同步的 RGB-D 帧中检测红/绿/黄/蓝方块，并解算其相对车体 ``base_link`` 的
+从同步的 RGB-D 帧中检测红、绿、黄、蓝方块，并解算其相对车体 ``base_link`` 的
 三维坐标，供对位与机械臂 IK 使用。
 
-彩色与深度**未配准**
---------------------
-相机 ``depth_registration=false``，且彩色 640x480@30、深度 640x400@10，两者像素
-不一一对应。本模块沿用现有 demo 的近似做法——按分辨率比例把彩色像素映射到深度
-图坐标；但取样时在 3x3 窗口内取**中位数**，比现有 demo 的单点取值更抗噪。
+彩色与深度未配准
+----------------
+相机 ``depth_registration`` 为假，且彩色 640x480@30fps、深度 640x400@10fps，
+两者像素不一一对应。本模块沿用现有 demo 的近似做法——按分辨率比例把彩色像素
+映射到深度图坐标；取样时在窗口内取中位数，比现有 demo 的单点取值更抗噪。
 
 坐标解算
 --------
-像素 + 深度 → 相机光学坐标系（z 向前、x 向右、y 向下）：
+像素加深度转相机光学坐标系，z 向前、x 向右、y 向下。横向偏移为 u 减
+center_x，按深度与焦距之比缩放即 camera_x；纵向同理用 v 与 center_y 得
+camera_y；camera_z 即深度本身。
 
-.. math::
-    X_c = (u - c_x) \\cdot d / f_x, \\quad
-    Y_c = (v - c_y) \\cdot d / f_y, \\quad
-    Z_c = d
-
-再用安装外参 ``mount_xyz`` / ``mount_rpy`` 变换到 ``base_link``。
+再用安装外参 ``mount_xyz`` 与 ``mount_rpy`` 变换到 ``base_link``。
 
 .. warning::
-   ``mount_rpy`` 随机械臂姿态变化（相机装在 4 连杆上）。只有**巡线姿态**
-   下完成定位、且外参已标定，转换结果才可信。未标定时请只用
-   ``distance_m``（光轴深度）与 ``lateral_m``（相机系横向），它们在相机系
-   内自洽，不依赖外参。
+   ``mount_rpy`` 随机械臂姿态变化，相机装在第 4 连杆上。只有在巡线姿态下完成
+   定位且外参已标定时，变换结果才可信。未标定时只用 ``distance_m`` 与
+   ``lateral_m``，它们在相机系内自洽，不依赖外参。
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -40,54 +36,120 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
-#: 默认相机内参（现有 demo 已标定，针对 640x480 彩色图）
+from maze_explorer._compat import StrEnum
+
+#: 默认相机内参，来自现有 demo 标定，针对 640x480 彩色图，焦距与主点单位 px
 DEFAULT_CAMERA_MATRIX = (
     (477.57421875, 0.0, 319.3820495605469),
     (0.0, 477.55718994140625, 238.64108276367188),
     (0.0, 0.0, 1.0),
 )
 
-COLOR_NAMES: Tuple[str, ...] = ('red', 'green', 'blue', 'yellow')
+#: 毫米换算到米的系数
+MILLIMETERS_PER_METER = 1000.0
+
+#: 调试节点打印检测摘要的周期，单位 s
+REPORT_PERIOD_SEC = 2.0
+
+
+class BlockColor(StrEnum):
+    """方块颜色，取值 red、green、blue、yellow 四者之一。
+
+    比赛规则不允许贴标记，识别只能走颜色路线；阈值来自
+    ``config/hsv_params.yaml``，须现场重标。
+    """
+
+    RED = 'red'
+    GREEN = 'green'
+    BLUE = 'blue'
+    YELLOW = 'yellow'
+
+
+#: 全部合法颜色，顺序固定，供参数键与统计表按同一顺序遍历
+COLOR_NAMES: Tuple[BlockColor, ...] = (
+    BlockColor.RED,
+    BlockColor.GREEN,
+    BlockColor.BLUE,
+    BlockColor.YELLOW,
+)
 
 
 @dataclass
 class BlockDetection:
-    """单个方块的一次观测。"""
+    """单个方块的一次观测。
 
-    color: str
-    u: float                  # 像素中心 x（彩色图坐标）
-    v: float                  # 像素中心 y
-    area: float               # 轮廓面积（像素）
-    distance_m: float         # 沿相机光轴的深度（m）
-    lateral_m: float          # 相机系横向偏移（m），正=右
-    vertical_m: float         # 相机系纵向偏移（m），正=下
-    yaw_rad: Optional[float] = None  # minAreaRect 估计的方块朝向（弧度）
-    #: 变换到 base_link 的坐标 (x 前, y 左, z 上)，外参未标定时为 None
+    :ivar color: 方块颜色，取值见 ``BlockColor``。
+    :ivar pixel_x: 彩色图上的质心横坐标，单位 px。
+    :ivar pixel_y: 彩色图上的质心纵坐标，单位 px。
+    :ivar area: 轮廓面积，单位像素平方，小于 ``min_area`` 的轮廓被忽略。
+    :ivar distance_m: 沿相机光轴的深度，单位 m，由深度图中位数解出。
+    :ivar lateral_m: 相机系横向偏移，单位 m，正为右。
+    :ivar vertical_m: 相机系纵向偏移，单位 m，正为下。
+    :ivar yaw_rad: 由 minAreaRect 估计的方块朝向，单位 rad，缺失时为 ``None``。
+    :ivar position_base: 变换到 base_link 的坐标三分量 x 前、y 左、z 上，
+        单位 m；外参未标定时为 ``None``。
+    """
+
+    color: BlockColor
+    #: 质心横坐标，单位 px
+    pixel_x: float
+    #: 质心纵坐标，单位 px
+    pixel_y: float
+    #: 轮廓面积，单位像素平方
+    area: float
+    #: 光轴深度，单位 m
+    distance_m: float
+    #: 相机系横向偏移，单位 m，正为右
+    lateral_m: float
+    #: 相机系纵向偏移，单位 m，正为下
+    vertical_m: float
+    #: 方块朝向，单位 rad，缺失时缺省
+    yaw_rad: Optional[float] = None
+    #: base_link 坐标三分量，单位 m，外参未标定时缺省
     position_base: Optional[Tuple[float, float, float]] = None
 
     def horizontal_distance(self) -> float:
-        """水平距离（相机系 xz 平面），用于与抓取包络比较。"""
+        """返回相机系 xz 平面内的水平距离，单位 m，用于与抓取包络比较。
+
+        :returns: 光轴深度与横向偏移的欧氏距离，不小于 0。
+        """
         return math.hypot(self.distance_m, self.lateral_m)
 
 
 def euler_to_matrix(rpy: Sequence[float]) -> np.ndarray:
-    """欧拉角（roll, pitch, yaw，ZYX 内旋）转 3x3 旋转矩阵。"""
-    r, p, y = float(rpy[0]), float(rpy[1]), float(rpy[2])
-    cr, sr = math.cos(r), math.sin(r)
-    cp, sp = math.cos(p), math.sin(p)
-    cy, sy = math.cos(y), math.sin(y)
+    """把 ZYX 内旋欧拉角转成 3x3 旋转矩阵。
+
+    :param rpy: 依次为 roll、pitch、yaw，单位 rad，长度 3。
+    :returns: 3x3 浮点数组，行列式为 1 的正交矩阵。
+    """
+    roll, pitch, yaw = float(rpy[0]), float(rpy[1]), float(rpy[2])
+    cos_roll, sin_roll = math.cos(roll), math.sin(roll)
+    cos_pitch, sin_pitch = math.cos(pitch), math.sin(pitch)
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
     return np.array(
         [
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp, cp * sr, cp * cr],
+            [
+                cos_yaw * cos_pitch,
+                cos_yaw * sin_pitch * sin_roll - sin_yaw * cos_roll,
+                cos_yaw * sin_pitch * cos_roll + sin_yaw * sin_roll,
+            ],
+            [
+                sin_yaw * cos_pitch,
+                sin_yaw * sin_pitch * sin_roll + cos_yaw * cos_roll,
+                sin_yaw * sin_pitch * cos_roll - cos_yaw * sin_roll,
+            ],
+            [
+                -sin_pitch,
+                cos_pitch * sin_roll,
+                cos_pitch * cos_roll,
+            ],
         ],
         dtype=np.float64,
     )
 
 
 class BlockDetector:
-    """四色方块检测与定位（不依赖 ROS，可离线单测）。"""
+    """四色方块检测与定位，不依赖 ROS，可离线单测。"""
 
     def __init__(
         self,
@@ -96,12 +158,24 @@ class BlockDetector:
         min_area: int = 300,
         morph_kernel: int = 5,
         depth_window: int = 1,
-        #: 相机相对 base_link 的位置 (x, y, z)
+        #: 相机相对 base_link 的位置三分量，单位 m，x 前 y 左 z 上
         mount_xyz: Sequence[float] = (0.10, 0.0, 0.35),
-        #: 相机相对 base_link 的姿态 (roll, pitch, yaw)
+        #: 相机相对 base_link 的姿态三分量，单位 rad，ZYX 内旋
         mount_rpy: Sequence[float] = (0.0, 0.0, 0.0),
         mount_calibrated: bool = False,
     ) -> None:
+        """配置颜色阈值、相机内参与安装外参。
+
+        :param hsv_map: 颜色到 HSV 六元组的映射，键取值见 ``BlockColor``。
+            H 取值 0 到 180，S 与 V 取值 0 到 255；缺键的颜色不参与检测。
+        :param camera_matrix: 3x3 相机内参矩阵，焦距与主点单位 px。
+        :param min_area: 判定方块所需的最小轮廓面积，单位像素平方。
+        :param morph_kernel: 形态学闭运算核的边长，单位像素，不小于 1。
+        :param depth_window: 深度取样的半窗口边长，单位像素，不小于 0。
+        :param mount_xyz: 相机相对 base_link 的平移，单位 m，须现场标定。
+        :param mount_rpy: 相机相对 base_link 的欧拉角，单位 rad，须现场标定。
+        :param mount_calibrated: 外参是否已标定。为假时不输出 ``position_base``。
+        """
         self._hsv: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         for name in COLOR_NAMES:
             if name not in hsv_map:
@@ -111,28 +185,30 @@ class BlockDetector:
                 np.array(values[:3], dtype=np.uint8),
                 np.array(values[3:], dtype=np.uint8),
             )
-        self._K = np.asarray(camera_matrix, dtype=np.float64)
-        self._fx = float(self._K[0, 0])
-        self._fy = float(self._K[1, 1])
-        self._cx = float(self._K[0, 2])
-        self._cy = float(self._K[1, 2])
+        self._camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+        self._focal_x = float(self._camera_matrix[0, 0])
+        self._focal_y = float(self._camera_matrix[1, 1])
+        self._principal_x = float(self._camera_matrix[0, 2])
+        self._principal_y = float(self._camera_matrix[1, 2])
         self._min_area = int(min_area)
         self._kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT, (int(morph_kernel), int(morph_kernel))
         )
-        self._win = max(0, int(depth_window))
+        self._window_radius = max(0, int(depth_window))
 
-        self._R = euler_to_matrix(mount_rpy)
-        self._t = np.asarray(mount_xyz, dtype=np.float64)
+        self._rotation = euler_to_matrix(mount_rpy)
+        self._translation = np.asarray(mount_xyz, dtype=np.float64)
         self.mount_calibrated = bool(mount_calibrated)
 
     # ------------------------------------------------------------------ 检测
 
     def detect(self, bgr: np.ndarray, depth_mm: np.ndarray) -> List[BlockDetection]:
-        """检测一帧中的所有方块。
+        """检测一帧中的全部方块，按距离由近到远排序。
 
-        :param bgr: 彩色图（BGR，640x480）。
-        :param depth_mm: 深度图（float32，单位 mm，640x400）。
+        :param bgr: 彩色图，BGR 三通道，典型尺寸 640x480。
+        :param depth_mm: 深度图，float32，单位 mm，典型尺寸 640x400，零与非
+            有限值视为无效深度。
+        :returns: 检出的方块列表，空图或无有效深度时为空列表。
         """
         if bgr is None or bgr.size == 0:
             return []
@@ -153,92 +229,148 @@ class BlockDetector:
                 moments = cv2.moments(contour)
                 if moments['m00'] <= 0:
                     continue
-                u = moments['m10'] / moments['m00']
-                v = moments['m01'] / moments['m00']
+                pixel_x = moments['m10'] / moments['m00']
+                pixel_y = moments['m01'] / moments['m00']
 
-                depth_m = self._sample_depth(depth_mm, bgr.shape, u, v)
+                depth_m = self._sample_depth(depth_mm, bgr.shape, pixel_x, pixel_y)
                 if depth_m is None:
                     continue
 
-                detection = self._localize(name, u, v, area, depth_m, contour)
-                results.append(detection)
+                results.append(
+                    self._localize(name, pixel_x, pixel_y, area, depth_m, contour)
+                )
 
-        # 按距离由近到远排序，便于优先处理最近目标
-        results.sort(key=lambda d: d.distance_m)
+        # 距离由近到远，便于优先处理最近目标
+        results.sort(key=lambda detection: detection.distance_m)
         return results
 
     def _sample_depth(
-        self, depth_mm: np.ndarray, color_shape: Tuple[int, ...], u: float, v: float
+        self,
+        depth_mm: np.ndarray,
+        color_shape: Tuple[int, ...],
+        pixel_x: float,
+        pixel_y: float,
     ) -> Optional[float]:
-        """把彩色像素映射到深度图坐标，取窗口内的有效中位数（米）。"""
+        """把彩色像素映射到深度图坐标，取窗口内有效深度的中位数。
+
+        彩色与深度分辨率不同，按宽高比例换算坐标；窗口内先剔除非有限值与非
+        正值再取中位数，比单点取值抗深度噪声。
+
+        :param depth_mm: 深度图，float32，单位 mm。
+        :param color_shape: 彩色图尺寸，高在前宽在后。
+        :param pixel_x: 彩色图质心横坐标，单位 px。
+        :param pixel_y: 彩色图质心纵坐标，单位 px。
+        :returns: 深度值，单位 m；越界或窗口内无有效值时为 ``None``。
+        """
         if depth_mm is None or depth_mm.size == 0:
             return None
-        dh, dw = depth_mm.shape[:2]
-        ch, cw = color_shape[:2]
-        du = int(round(u * dw / cw))
-        dv = int(round(v * dh / ch))
-        if not (0 <= du < dw and 0 <= dv < dh):
+        depth_height, depth_width = depth_mm.shape[:2]
+        color_height, color_width = color_shape[:2]
+        depth_x = int(round(pixel_x * depth_width / color_width))
+        depth_y = int(round(pixel_y * depth_height / color_height))
+        if not (0 <= depth_x < depth_width and 0 <= depth_y < depth_height):
             return None
 
-        w = self._win
-        window = depth_mm[max(0, dv - w):dv + w + 1, max(0, du - w):du + w + 1]
+        radius = self._window_radius
+        window = depth_mm[
+            max(0, depth_y - radius):depth_y + radius + 1,
+            max(0, depth_x - radius):depth_x + radius + 1,
+        ]
         valid = window[np.isfinite(window)]
         valid = valid[valid > 0.0]
         if valid.size == 0:
             return None
-        return float(np.median(valid)) / 1000.0
+        return float(np.median(valid)) / MILLIMETERS_PER_METER
 
     def _localize(
-        self, name: str, u: float, v: float, area: float, depth_m: float, contour
+        self,
+        color: BlockColor,
+        pixel_x: float,
+        pixel_y: float,
+        area: float,
+        depth_m: float,
+        contour,
     ) -> BlockDetection:
-        """由像素与深度解算相机系与 base_link 坐标。"""
-        x_c = (u - self._cx) * depth_m / self._fx
-        y_c = (v - self._cy) * depth_m / self._fy
-        z_c = depth_m
+        """由像素与深度解算相机系坐标，外参已标定时再转 base 系。
+
+        :param color: 方块颜色，取值见 ``BlockColor``。
+        :param pixel_x: 彩色图质心横坐标，单位 px。
+        :param pixel_y: 彩色图质心纵坐标，单位 px。
+        :param area: 轮廓面积，单位像素平方。
+        :param depth_m: 该处光轴深度，单位 m。
+        :param contour: 轮廓点集，供估计方块朝向。
+        :returns: 含相机系量的观测；``mount_calibrated`` 为假时
+            ``position_base`` 为 ``None``。
+        """
+        camera_x = (pixel_x - self._principal_x) * depth_m / self._focal_x
+        camera_y = (pixel_y - self._principal_y) * depth_m / self._focal_y
+        camera_z = depth_m
 
         rect = cv2.minAreaRect(contour)
-        yaw = math.radians(rect[2])
+        yaw_rad = math.radians(rect[2])
 
         position_base: Optional[Tuple[float, float, float]] = None
         if self.mount_calibrated:
-            p = self._R @ np.array([x_c, y_c, z_c], dtype=np.float64) + self._t
-            position_base = (float(p[0]), float(p[1]), float(p[2]))
+            point = (
+                self._rotation
+                @ np.array([camera_x, camera_y, camera_z], dtype=np.float64)
+                + self._translation
+            )
+            position_base = (float(point[0]), float(point[1]), float(point[2]))
 
         return BlockDetection(
-            color=name,
-            u=u,
-            v=v,
+            color=color,
+            pixel_x=pixel_x,
+            pixel_y=pixel_y,
             area=area,
-            distance_m=z_c,
-            lateral_m=x_c,
-            vertical_m=y_c,
-            yaw_rad=yaw,
+            distance_m=camera_z,
+            lateral_m=camera_x,
+            vertical_m=camera_y,
+            yaw_rad=yaw_rad,
             position_base=position_base,
         )
 
     # ------------------------------------------------------------ 便捷查询
 
     @staticmethod
-    def nearest(detections: Sequence[BlockDetection], color: Optional[str] = None) -> Optional[BlockDetection]:
-        """返回最近的方块；``color`` 非空时只在指定颜色中筛选。"""
-        pool = [d for d in detections if color is None or d.color == color]
+    def nearest(
+        detections: Sequence[BlockDetection], color: Optional[BlockColor] = None
+    ) -> Optional[BlockDetection]:
+        """返回最近的方块，指定颜色时只在该颜色内筛选。
+
+        :param detections: 待筛选的观测列表。
+        :param color: 颜色过滤条件，取 ``None`` 表示不限颜色。
+        :returns: 距离最小的观测；候选为空时为 ``None``。
+        """
+        pool = [
+            detection
+            for detection in detections
+            if color is None or detection.color == color
+        ]
         if not pool:
             return None
-        return min(pool, key=lambda d: d.distance_m)
+        return min(pool, key=lambda detection: detection.distance_m)
 
     @staticmethod
     def in_grasp_envelope(
         detection: BlockDetection, dist_min: float, dist_max: float
     ) -> bool:
-        """判断方块是否落在机械臂抓取包络（水平距离区间）内。"""
-        d = detection.horizontal_distance()
-        return dist_min <= d <= dist_max
+        """判断方块是否落在机械臂抓取包络的水平距离区间内。
+
+        :param detection: 待判断观测。
+        :param dist_min: 包络下界，单位 m，机械臂低于该距离抓不到。
+        :param dist_max: 包络上界，单位 m，超出则对位无效。
+        :returns: 水平距离落在闭区间内时为真。
+        """
+        distance = detection.horizontal_distance()
+        return dist_min <= distance <= dist_max
 
 
 class BlockDetectorNode(Node):
-    """独立调试用节点：订阅 RGB-D 并打印检测结果。"""
+    """独立调试节点，订阅 RGB-D 并打印检测结果。"""
 
     def __init__(self) -> None:
+        """声明检测参数并装配检测器，使调试节点可脱离上层独立出数。"""
         super().__init__('block_detector')
 
         self.declare_parameter('color_topic', '/camera/color/image_raw')
@@ -280,17 +412,22 @@ class BlockDetectorNode(Node):
             slop=float(self.get_parameter('sync_slop_sec').value),
         )
         self._sync.registerCallback(self._on_rgbd)
-        self.create_timer(2.0, self._report)
+        self.create_timer(REPORT_PERIOD_SEC, self._report)
         self._last_count = 0
 
         if not self._det.mount_calibrated:
             self.get_logger().warn(
-                'mount_calibrated=false：只输出相机系量（distance_m/lateral_m），'
+                'mount_calibrated=false：只输出相机系量 distance_m 与 lateral_m，'
                 'position_base 为 None。需现场标定相机外参后置 true'
             )
         self.get_logger().info(f'BlockDetector 就绪 | 颜色 {list(hsv_map)}')
 
     def _on_rgbd(self, color_msg: Image, depth_msg: Image) -> None:
+        """转换同步帧、执行检测并打印摘要。
+
+        :param color_msg: 彩色图消息。
+        :param depth_msg: 与之时间配准的深度图消息。
+        """
         try:
             bgr = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
@@ -302,17 +439,23 @@ class BlockDetectorNode(Node):
         self._last_count = len(detections)
         if detections:
             summary = ', '.join(
-                f'{d.color}@{d.distance_m:.2f}m/{(d.lateral_m * 100):+.0f}cm'
-                for d in detections
+                f'{detection.color}@{detection.distance_m:.2f}m'
+                f'/{(detection.lateral_m * 100):+.0f}cm'
+                for detection in detections
             )
             self.get_logger().info(f'检测到 {len(detections)} 个方块：{summary}')
 
     def _report(self) -> None:
+        """无方块时按节流周期提示一次。"""
         if self._last_count == 0:
             self.get_logger().info('当前视野内无方块', throttle_duration_sec=10.0)
 
 
-def main(args=None) -> None:
+def main(args: Optional[List[str]] = None) -> None:
+    """调试节点入口：初始化、自旋、退出时按序关闭。
+
+    :param args: 传给 ``rclpy.init`` 的命令行参数，取 ``None`` 时读进程参数。
+    """
     rclpy.init(args=args)
     node = BlockDetectorNode()
     try:

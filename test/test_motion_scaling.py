@@ -23,7 +23,7 @@ from maze_explorer.motion_controller import MotionController
 
 @pytest.fixture(scope='module', autouse=True)
 def _rclpy_context():
-    """``turn_to_heading`` 以 ``rclpy.ok()`` 作循环条件，须先初始化上下文。"""
+    """``turn_to_heading`` 以 ``rclpy`` 的 ok 接口作循环条件，须先初始化上下文。"""
     if not rclpy.ok():
         rclpy.init()
     yield
@@ -35,22 +35,29 @@ class FakeBase:
     """最小底盘桩：记录速度，由 spin 推进 yaw。"""
 
     def __init__(self, yaw: float = 0.0) -> None:
+        """给定初始 yaw，速度初值三轴为 0。"""
         self.yaw = yaw
         self.vel = (0.0, 0.0, 0.0)
         self._yaw_override: Optional[bool] = None
 
     def get_pose(self):
+        """返回 x 与 y 恒 0 的位姿，只有 yaw 参与闭环。"""
         return (0.0, 0.0, self.yaw)
 
     def get_yaw(self):
+        """里程计可用时返回 yaw，模拟失效时返回 None。"""
         if self._yaw_override is None:
             return self.yaw
         return None
 
-    def set_velocity(self, vx: float = 0.0, vy: float = 0.0, wz: float = 0.0) -> None:
-        self.vel = (vx, vy, wz)
+    def set_velocity(
+        self, linear_x: float = 0.0, linear_y: float = 0.0, angular_z: float = 0.0
+    ) -> None:
+        """记录速度指令供闭环与断言读取。"""
+        self.vel = (linear_x, linear_y, angular_z)
 
     def stop(self) -> None:
+        """清零速度，供放弃动作路径调用。"""
         self.vel = (0.0, 0.0, 0.0)
 
     def drop_odom(self) -> None:
@@ -59,6 +66,8 @@ class FakeBase:
 
 
 class FakeLogger:
+    """空实现日志桩：被测代码打日志时不报错也不产生输出。"""
+
     def warn(self, *args, **kwargs) -> None:  # noqa: D102
         pass
 
@@ -70,11 +79,14 @@ class FakeNode:
     """只提供 MotionController 用到的 logger。"""
 
     def get_logger(self) -> FakeLogger:
+        """返回吞日志的 logger，仅满足接口。"""
         return FakeLogger()
 
 
 def _make_controller(base: FakeBase, ang_scale: float, dt: float = 0.02) -> MotionController:
+    """构造带角速度积分桩的控制器，系数与容差按参数注入。"""
     def spin(_timeout: float) -> None:
+        """每次自旋把角速度按 dt 积分进 yaw，模拟底盘响应。"""
         # 模拟 0.02 秒的角速度积分
         base.yaw += base.vel[2] * dt
 
@@ -99,7 +111,7 @@ def _make_controller(base: FakeBase, ang_scale: float, dt: float = 0.02) -> Moti
     ],
 )
 def test_turn_scaling_uses_division(ang_scale: float, expected_odom_delta: float) -> None:
-    """转向到正北（+90 度）后，odom 的 yaw 变化应为「目标 / 系数」。"""
+    """转向到正北即 +90 度后，odom 的 yaw 变化应为「目标 / 系数」。"""
     base = FakeBase(yaw=0.0)
     controller = _make_controller(base, ang_scale)
 
@@ -108,7 +120,7 @@ def test_turn_scaling_uses_division(ang_scale: float, expected_odom_delta: float
 
 
 def test_turn_scaling_negative_direction() -> None:
-    """向南（-90 度）时方向也要正确，且同样遵守除法语义。"""
+    """向南即 -90 度时方向也要正确，且同样遵守除法语义。"""
     base = FakeBase(yaw=0.0)
     controller = _make_controller(base, 0.5)
 
@@ -120,6 +132,7 @@ def test_turn_scaling_negative_direction() -> None:
 # ------------------------------------------------------------------ 边界
 
 def test_turn_when_already_aligned_does_not_move() -> None:
+    """已对准时不应再下发转动指令。"""
     base = FakeBase(yaw=math.pi / 2)  # 已朝北
     controller = _make_controller(base, 1.0)
 
@@ -128,6 +141,7 @@ def test_turn_when_already_aligned_does_not_move() -> None:
 
 
 def test_turn_without_odom_returns_false() -> None:
+    """里程计失效时返回 False，由上层转入故障处理。"""
     base = FakeBase(yaw=0.0)
     base.drop_odom()
     controller = _make_controller(base, 1.0)
